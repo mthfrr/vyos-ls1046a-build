@@ -96,6 +96,21 @@ OUT_IP=$(d "ip route show default | awk '{print \$5; exit}'")
 o "ping -c2 -W2 $OUT_IP" >/dev/null 2>&1 || abort preflight "OUT_HOST cannot reach the DUT OUT address $OUT_IP (check OUT_HOST/$OUT_HOST_IF)"
 o "which iperf3" >/dev/null || abort preflight 'iperf3 missing on OUT_HOST'
 p "which iperf3" >/dev/null || abort preflight 'iperf3 missing on PEER'
+OUT_HOST_H=${OUT_HOST#*@}
+OUT_HOST_IP=$(python3 -c "import socket;print(socket.gethostbyname('$OUT_HOST_H'))")
+o "ip -4 addr show dev $OUT_HOST_IF" 2>/dev/null | grep -q "$OUT_HOST_IP" \
+  || abort preflight "OUT_HOST ($OUT_HOST_H -> $OUT_HOST_IP) is not an address on $OUT_HOST_IF - point OUT_HOST at its data-side address facing the DUT OUT network"
+# v6 transit endpoint is optional; without it P3 v6 SKIPs (a v6 iperf to the
+# DUT's own bond address would terminate locally and can never be offloaded)
+OUT6_ADDR=$(o "ip -6 addr show dev $OUT_HOST_IF scope global | awk '/inet6/{print \$2; exit}'")
+if [ -z "$OUT6_ADDR" ] || ! d "ip -6 route show default | grep -q ." ; then
+  OUT6_ADDR=""
+  V6RT=""
+else
+  # PEER reaches the OUT network's v6 space through the DUT via the bond
+  OUT6_NET=$(python3 -c "import ipaddress;print(ipaddress.IPv6Interface('$OUT6_ADDR').network)")
+  V6RT="set protocols static interface-route $OUT6_NET next-hop-0 $B6_IP"
+fi
 for i in $DUT_PORTS; do d "sudo ip addr flush dev $i; sudo ip link set $i nomaster 2>/dev/null; true"; done
 
 ##### P1 — bond bring-up both sides, LACP active
@@ -106,7 +121,7 @@ vy_d "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 l
 vy_p "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 lacp-rate fast" \
      $(for i in $PEER_PORTS; do echo "set interfaces bonding bond0 member interface $i"; done) \
      "set interfaces bonding bond0 address ${PEER_BOND_IP}/24" "set interfaces bonding bond0 address ${PEER_B6}/64" \
-     "set protocols static route $B4_NET next-hop $BOND_IP"
+     "set protocols static route ${OUT_HOST_IP}/32 next-hop $BOND_IP" ${V6RT:+$V6RT}
 sleep 15
 d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-proc.txt"
 p "cat /proc/net/bonding/bond0" > "$RUN/bond-peer-proc.txt"
@@ -117,7 +132,7 @@ if d "ping -c2 -W2 $PEER_BOND_IP >/dev/null" && p "ping -c2 -W2 $BOND_IP >/dev/n
 else
   abort P1 'bond0 not reachable - check DUT_PORTS<->PEER_PORTS cabling order (swapping PEER_PORTS is the usual fix)'
 fi
-p "ping -c2 -W2 $OUT_HOST >/dev/null" || abort preflight 'PEER cannot reach OUT_HOST via the new route (check the OUT subnet assumption)'
+p "ping -c2 -W2 $OUT_HOST_IP >/dev/null" || abort preflight 'PEER cannot reach OUT_HOST via the new route (check the OUT subnet assumption)'
 o "sudo ip route replace $B4_NET via $OUT_IP dev $OUT_HOST_IF"
 
 ##### P2 — patch 061 rendering: auto flowtable on bond0, hw-tc-offload on members
@@ -135,9 +150,9 @@ done
 ##### P3 — steady-state offload: flows present, DUT CPUs idle
 o "pkill -f 'iperf3 -s' 2>/dev/null; iperf3 -s -D -p 5281" >/dev/null 2>&1
 iperf_run(){ # iperf_run <4|6> -> Gbit/s on stdout
-  local src=$PEER_BOND_IP dst=$BOND_IP
-  [ "$1" = 6 ] && { src=$PEER_B6_IP; dst=$B6_IP; }
-  p "timeout $((DUR + 30)) iperf3 -c $OUT_HOST -B $src -p 5281 -P 4 -t $DUR -Z -J" > "$RUN/bond-iperf-v$1.json"
+  local src=$PEER_BOND_IP dst=$OUT_HOST_IP
+  [ "$1" = 6 ] && { src=$PEER_B6_IP; dst=${OUT6_ADDR%/*}; }
+  p "timeout $((DUR + 30)) iperf3 -c $dst -B $src -p 5281 -P 4 -t $DUR -Z -J" > "$RUN/bond-iperf-v$1.json"
   python3 - "$RUN/bond-iperf-v$1.json" <<'PY'
 import json, sys
 try: j = json.load(open(sys.argv[1])); print('%.2f' % (j['end']['sum_received']['bits_per_second'] / 1e9))
@@ -145,6 +160,10 @@ except Exception: print(0)
 PY
 }
 for rep in $(seq 1 "$REPS"); do for fam in 4 6; do
+  if [ "$fam" = 6 ] && [ -z "$OUT6_ADDR" ]; then
+    [ "$rep" = 1 ] && res SKIP P3 'no global v6 on the OUT side (OUT_HOST data NIC or DUT default v6 missing) - v6 transit not measurable here'
+    continue
+  fi
   c0=$(cpu); gb=$(iperf_run "$fam" | tail -1); c1=$(cpu); b=$(busy "$c0" "$c1")
   sleep 2
   flows > "$RUN/bond-flowcount-v$fam-r$rep.txt"
@@ -162,8 +181,8 @@ d "sudo timeout 10 tcpdump -qi bond0 -c2 'ether proto 0x8809' -nn" > "$RUN/bond-
   || res FAIL P4 'no LACPDUs on bond0 - punt regression (bond-lacpdu.txt)'
 
 ##### P5 — failover under load: pull one member, measure the transit gap (Inc 3 input)
-p "iperf3 -c $OUT_HOST -B $PEER_BOND_IP -p 5281 -t $((2 * FAILSECS)) -i 1 > /tmp/bond-fail-iperf.json 2>&1 &
-   ping -i 0.1 -c $((10 * (2 * FAILSECS))) $OUT_HOST > /tmp/bond-fail-ping.txt 2>&1 &"
+p "iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t $((2 * FAILSECS)) -i 1 > /tmp/bond-fail-iperf.json 2>&1 &
+   ping -i 0.1 -c $((10 * (2 * FAILSECS))) $OUT_HOST_IP > /tmp/bond-fail-ping.txt 2>&1 &"
 sleep 5
 d "sudo ip link set $MEM1 down"
 sleep $((FAILSECS - 5))
@@ -192,7 +211,7 @@ sleep 1
 if d "timeout 6 tcpdump -qi $MEM1 -c1 'ether proto 0x8809'" >/dev/null 2>&1; then
   res SKIP P6 'tc filter did not stop LACPDUs (syntax varies by iproute2) - repeat the drop your way, then measure'
 else
-  p "ping -i 0.2 -c 150 $OUT_HOST > /tmp/bond-quiet-ping.txt 2>&1" || true
+  p "ping -i 0.2 -c 150 $OUT_HOST_IP > /tmp/bond-quiet-ping.txt 2>&1" || true
   p "cat /tmp/bond-quiet-ping.txt" > "$RUN/bond-quiet-transition-ping.txt" 2>/dev/null
   d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-quiet.txt"
   res MEASURE P6 'LACPDUs stopped, carrier kept: blackhole window from bond-quiet-transition-ping.txt (Inc 3 §4 - was traffic silently HW-pinned to the stale slave?)'
@@ -201,7 +220,7 @@ p "sudo tc qdisc del dev $PEER_MEM ingress 2>/dev/null"
 sleep 30
 
 ##### P7 — member re-add cycles under churn, record-leak watch
-p "iperf3 -c $OUT_HOST -B $PEER_BOND_IP -p 5281 -t $((8 * LEAK_REPS)) -P 4 -i 5 > /dev/null 2>&1 &"
+p "iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t $((8 * LEAK_REPS)) -P 4 -i 5 > /dev/null 2>&1 &"
 sleep 3
 base=$(flows)
 for i in $(seq 1 "$LEAK_REPS"); do
@@ -216,7 +235,7 @@ res MEASURE P7 "flow table: baseline=$base after $LEAK_REPS member cycles=$after
 ##### P8 — budget clamp (D5: overflow must stay in software, never wedge)
 before=$(d "cat /sys/module/ask/parameters/max_flows")
 d "sudo sh -c 'echo 4 > /sys/module/ask/parameters/max_flows'"
-p "for n in 1 2 3 4 5 6 7 8; do (iperf3 -c $OUT_HOST -B $PEER_BOND_IP -p 5281 -t 6 -P 1 -w 256k >/dev/null 2>&1 &); sleep 1; done"
+p "for n in 1 2 3 4 5 6 7 8; do (iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t 6 -P 1 -w 256k >/dev/null 2>&1 &); sleep 1; done"
 sleep 8
 n_clamped=$(flows)
 d "sudo sh -c 'echo $before > /sys/module/ask/parameters/max_flows'"
