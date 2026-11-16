@@ -1,0 +1,318 @@
+vyos-1x-061-bonding-hw-offload.patch
+
+LS1046A ASK2: `set interfaces bonding bondX offload ipv4|ipv6`. Adds the
+offload leafs to the bonding interface definition; makes offload.ipv4/ipv6
+inherited bond options so member re-commits keep the family mask the bond
+owns (member apply arms the FMan port through the existing
+EthernetIf.set_ask_offload() path); verifies the kernel contract (mode
+802.3ad, MTU 1280..9000, members are FMan ports eth0-eth4; VPP mutex and
+the existing member checks already apply); re-runs members + firewall on
+offload leaf / member-set changes via the configd dependency machinery;
+extends the patch 058 auto hardware flowtable to offloaded bonds (device =
+bond master; ask.ko spreads ingress records across members itself) and
+resolves flowtable devices to member ports for `ethtool -K
+hw-tc-offload on` since the bond master owns no NETIF_F_HW_TC.
+
+Pairs with kernel Increments 1+2 (see doc/CHANGES-LACP.md upstream notes).
+
+diff --git a/interface-definitions/interfaces_bonding.xml.in b/interface-definitions/interfaces_bonding.xml.in
+index 6eca96fb1..702325482 100644
+--- a/interface-definitions/interfaces_bonding.xml.in
++++ b/interface-definitions/interfaces_bonding.xml.in
+@@ -247,6 +247,25 @@
+             </properties>
+             <defaultValue>802.3ad</defaultValue>
+           </leafNode>
++          <node name="offload">
++            <properties>
++              <help>Interface transmit/receive offload options</help>
++            </properties>
++            <children>
++              <leafNode name="ipv4">
++                <properties>
++                  <help>ASK2 hardware offload for IPv4 forwarded flows on this bond (NXP LS1046A FMan FE-VM); arms every member port, requires mode 802.3ad</help>
++                  <valueless/>
++                </properties>
++              </leafNode>
++              <leafNode name="ipv6">
++                <properties>
++                  <help>ASK2 hardware offload for IPv6 forwarded flows on this bond (NXP LS1046A FMan FE-VM); arms every member port, requires mode 802.3ad</help>
++                  <valueless/>
++                </properties>
++              </leafNode>
++            </children>
++          </node>
+           <node name="member">
+             <properties>
+               <help>Bridge member interfaces</help>
+diff --git a/python/vyos/ifconfig/bond.py b/python/vyos/ifconfig/bond.py
+index 3b81801c3..286492941 100644
+--- a/python/vyos/ifconfig/bond.py
++++ b/python/vyos/ifconfig/bond.py
+@@ -105,7 +105,16 @@ def get_inherit_bond_options() -> list:
+         :rtype: list
+         """
+         options = [
+-            'mtu'
++            'mtu',
++            # LS1046A ASK2 bond offload: the offload leaves live on the bond,
++            # but the per-port FMan arming happens in the member's own
++            # interfaces_ethernet apply (EthernetIf.update() ->
++            # set_ask_offload()). Inheriting the leaves the same way MTU is
++            # inherited is what keeps a member re-commit (e.g. description
++            # edit) from computing family mask 0 from its own leaf-less
++            # config and disengaging the port the bond relies on.
++            'offload.ipv4',
++            'offload.ipv6',
+         ]
+         return options
+ 
+diff --git a/src/conf_mode/firewall.py b/src/conf_mode/firewall.py
+index 08086e5d8..6b0f417cf 100644
+--- a/src/conf_mode/firewall.py
++++ b/src/conf_mode/firewall.py
+@@ -137,6 +137,10 @@ def get_ask_auto_flowtable(conf, firewall):
+                                     key_mangling=('-', '_'),
+                                     get_first_key=True,
+                                     no_tag_node_value_mangle=True)
++    bonding = conf.get_config_dict(['interfaces', 'bonding'],
++                                   key_mangling=('-', '_'),
++                                   get_first_key=True,
++                                   no_tag_node_value_mangle=True)
+     user_ifaces = set()
+     for flowtable_conf in (firewall.get('flowtable') or {}).values():
+         user_ifaces.update(flowtable_conf.get('interface', []))
+@@ -149,6 +153,16 @@ def get_ask_auto_flowtable(conf, firewall):
+         for family in ('ipv4', 'ipv6'):
+             if family in offload:
+                 auto.setdefault(family, []).append(ifname)
++    # LS1046A ASK2 bond offload (Inc 4): an offloaded bond joins the auto
++    # flowtable with its master netdev; ask.ko puts one ingress FE record on
++    # each eligible member itself, so the flowtable only knows bondX.
++    for ifname, if_conf in sorted(bonding.items()):
++        if ifname in user_ifaces or 'disable' in if_conf:
++            continue
++        offload = if_conf.get('offload') or {}
++        for family in ('ipv4', 'ipv6'):
++            if family in offload:
++                auto.setdefault(family, []).append(ifname)
+     return auto
+ 
+ def get_config(config=None):
+@@ -568,45 +582,61 @@ def get_hardware_offload_interface(ifname):
+     return lower_name[len('lower_'):]
+ 
+ 
+-def verify_hardware_offload(ifname):
++def get_hardware_offload_interfaces(ifname):
++    """Netdevs whose driver actually carries the offload path for flowtable
++    device `ifname` (LS1046A ASK2, Inc 4). A bond master owns no
++    hw-tc-offload of its own - bonding keeps NETIF_F_HW_TC out of its
++    feature set and rejects ethtool -K - so resolve to the current member
++    ports the kernel reports. VLAN subinterfaces are resolved to their
++    unique parent first by get_hardware_offload_interface()."""
+     hardware_ifname = get_hardware_offload_interface(ifname)
+-    ethtool = Ethtool(hardware_ifname)
+-    enabled, fixed = ethtool.get_hw_tc_offload()
+-
+-    if not enabled and fixed:
+-        raise ConfigError(f'Interface "{ifname}" does not support hardware offload')
+-
+-    # LS1046A ASK2 (2026-08-21): a hardware flowtable engages FMan FE
+-    # forwarding, bounded to the order-0 RX buffer's conservative MTU range
+-    # (1280..3600). The DPAA1 RX pool is one contiguous 4 KiB order-0 page
+-    # (F-222); frames above the ceiling overrun the one-buffer FMan RX contract
+-    # (cold-boot-only recovery), and below the floor is untested. Arming a
+-    # hardware flowtable on an interface whose MTU is outside this range can
+-    # brick connectivity remotely. Read the authoritative live MTU from sysfs
+-    # and fail closed outside [ASK_FT_MTU_MIN, ASK_FT_MTU_MAX]. The default
+-    # 1500 is inside the range, so standard interfaces pass. Widen once a
+-    # larger range is validated on the FMan RX pool.
+-    ASK_FT_MTU_MIN = 1280
+-    ASK_FT_MTU_MAX = 9000
+-    mtu_path = f'/sys/class/net/{hardware_ifname}/mtu'
+     try:
+-        with open(mtu_path) as f:
+-            mtu = int(f.read().strip())
+-    except (OSError, ValueError):
+-        mtu = None
+-    if mtu is not None and (mtu < ASK_FT_MTU_MIN or mtu > ASK_FT_MTU_MAX):
+-        raise ConfigError(
+-            f'Interface "{ifname}" hardware flowtable offload requires MTU '
+-            f'between {ASK_FT_MTU_MIN} and {ASK_FT_MTU_MAX} (live MTU {mtu} '
+-            f'is outside the validated range and can wedge the FMan RX path). '
+-            f'Set a supported MTU before enabling "offload hardware".'
+-        )
++        with open(f'/sys/class/net/{hardware_ifname}/bonding/members') as f:
++            members = f.read().split()
++    except OSError:
++        return [hardware_ifname]
++    return members or [hardware_ifname]
++
++
++def verify_hardware_offload(ifname):
++    for hardware_ifname in get_hardware_offload_interfaces(ifname):
++        ethtool = Ethtool(hardware_ifname)
++        enabled, fixed = ethtool.get_hw_tc_offload()
++
++        if not enabled and fixed:
++            raise ConfigError(f'Interface "{ifname}" does not support hardware offload')
++
++        # LS1046A ASK2 (2026-08-21): a hardware flowtable engages FMan FE
++        # forwarding, bounded to the order-0 RX buffer's conservative MTU range
++        # (1280..3600). The DPAA1 RX pool is one contiguous 4 KiB order-0 page
++        # (F-222); frames above the ceiling overrun the one-buffer FMan RX contract
++        # (cold-boot-only recovery), and below the floor is untested. Arming a
++        # hardware flowtable on an interface whose MTU is outside this range can
++        # brick connectivity remotely. Read the authoritative live MTU from sysfs
++        # and fail closed outside [ASK_FT_MTU_MIN, ASK_FT_MTU_MAX]. The default
++        # 1500 is inside the range, so standard interfaces pass. Widen once a
++        # larger range is validated on the FMan RX pool.
++        ASK_FT_MTU_MIN = 1280
++        ASK_FT_MTU_MAX = 9000
++        mtu_path = f'/sys/class/net/{hardware_ifname}/mtu'
++        try:
++            with open(mtu_path) as f:
++                mtu = int(f.read().strip())
++        except (OSError, ValueError):
++            mtu = None
++        if mtu is not None and (mtu < ASK_FT_MTU_MIN or mtu > ASK_FT_MTU_MAX):
++            raise ConfigError(
++                f'Interface "{ifname}" hardware flowtable offload requires MTU '
++                f'between {ASK_FT_MTU_MIN} and {ASK_FT_MTU_MAX} (live MTU {mtu} '
++                f'is outside the validated range and can wedge the FMan RX path). '
++                f'Set a supported MTU before enabling "offload hardware".'
++            )
+ 
+-    # F-192 (LS1046A, 2026-08-14): NETIF_F_HW_TC is toggleable but defaults
+-    # OFF on the DPAA1 netdev, and the standard `offload hw-tc-offload`
+-    # interface config never applies it at runtime.  apply() switches the
+-    # feature on directly (ethtool -K) before the flowtable is installed, so
+-    # a toggleable-but-off state here is not an error.
++        # F-192 (LS1046A, 2026-08-14): NETIF_F_HW_TC is toggleable but defaults
++        # OFF on the DPAA1 netdev, and the standard `offload hw-tc-offload`
++        # interface config never applies it at runtime.  apply() switches the
++        # feature on directly (ethtool -K) before the flowtable is installed, so
++        # a toggleable-but-off state here is not an error.
+ 
+ def verify(firewall):
+     # G1: the auto flowtable inherits the hardware-flowtable MTU gate.
+@@ -905,11 +935,15 @@ def apply(firewall):
+         for flowtable, flowtable_conf in firewall['flowtable'].items():
+             if dict_search_args(flowtable_conf, 'offload') == 'hardware':
+                 for ifname in flowtable_conf['interface']:
+-                    hardware_ifname = get_hardware_offload_interface(ifname)
+-                    cmdl(['ethtool', '-K', hardware_ifname, 'hw-tc-offload', 'on'])
++                    for hardware_ifname in get_hardware_offload_interfaces(ifname):
++                        cmdl(['ethtool', '-K', hardware_ifname, 'hw-tc-offload', 'on'])
+ 
+     for ifname in sorted(set(sum(firewall.get('ask_auto_flowtable', {}).values(), []))):
+-        cmdl(['ethtool', '-K', ifname, 'hw-tc-offload', 'on'])
++        # A bond device expands to its member ports (see
++        # get_hardware_offload_interfaces()); the bond master itself rejects
++        # ethtool -K.
++        for hardware_ifname in get_hardware_offload_interfaces(ifname):
++            cmdl(['ethtool', '-K', hardware_ifname, 'hw-tc-offload', 'on'])
+ 
+     # Use nft -c option to check current configuration file
+     completed_process = subp_run(['nft', '-c', '--file', nftables_conf], capture_output=True)
+diff --git a/src/conf_mode/interfaces_bonding.py b/src/conf_mode/interfaces_bonding.py
+index aea0bc83b..10c6af3e7 100644
+--- a/src/conf_mode/interfaces_bonding.py
++++ b/src/conf_mode/interfaces_bonding.py
+@@ -160,6 +160,26 @@ def get_config(config=None):
+             tmp = has_vrf_configured(conf, interface)
+             if tmp: bond['member']['interface'][interface].update({'has_vrf' : ''})
+ 
++    # LS1046A ASK2 bond offload (Inc 4): `offload ipv4|ipv6` on a bond arms
++    # the members' FMan ports (through bond option inheritance, see bond.py
++    # get_inherit_bond_options(), so the arming itself runs in each member's
++    # interfaces_ethernet apply) and contributes bondX to firewall.py's auto
++    # hardware flowtable. Re-run the members whenever the leaves or the
++    # member set change under an offloaded bond, and firewall whenever the
++    # leaves change. The 'offload_changed' marker triggers call_dependents()
++    # in apply() below.
++    ask_offload_changed = bool(
++        is_node_changed(conf, base + [ifname, 'offload', 'ipv4']) or
++        is_node_changed(conf, base + [ifname, 'offload', 'ipv6']))
++    ask_new_members = any('new_added' in c
++                          for c in (dict_search('member.interface', bond) or {}).values())
++    if ask_offload_changed or ('offload' in bond and ask_new_members):
++        bond.update({'offload_changed': {}})
++        for interface in (dict_search('member.interface', bond) or {}):
++            set_dependents('ethernet', conf, interface)
++        if ask_offload_changed:
++            set_dependents('firewall', conf)
++
+     # Protocols static arp dependency
+     if 'static_arp' in bond:
+         set_dependents('static_arp', conf)
+@@ -204,6 +224,27 @@ def verify(bond):
+     verify_vlan_config(bond)
+ 
+     bond_name = bond['ifname']
++
++    # LS1046A ASK2 bond offload (Inc 4): fail closed on anything outside the
++    # kernel contract (PLAN.md D5). The MTU bounds mirror patch 036/037
++    # (those files keep their own copies of the same constants).
++    ask_offload = (dict_search('offload.ipv4', bond) is not None or
++                   dict_search('offload.ipv6', bond) is not None)
++    if ask_offload:
++        ASK_OFFLOAD_MTU_MIN = 1280
++        ASK_OFFLOAD_MTU_MAX = 9000
++        if bond.get('mode') != '802.3ad':
++            raise ConfigError('ASK2 hardware offload on a bonding interface '
++                              'requires "mode 802.3ad"; other bond modes are '
++                              'not supported for offload')
++        mtu = int(bond.get('mtu', 1500))
++        if mtu < ASK_OFFLOAD_MTU_MIN or mtu > ASK_OFFLOAD_MTU_MAX:
++            raise ConfigError(
++                f'Bonding interface ASK2 offload requires MTU between '
++                f'{ASK_OFFLOAD_MTU_MIN} and {ASK_OFFLOAD_MTU_MAX} (configured '
++                f'MTU {mtu} is outside the validated range and can wedge the '
++                f'FMan RX path)')
++
+     if dict_search('member.interface', bond):
+         for interface, interface_config in bond['member']['interface'].items():
+             error_msg = f'Cannot add interface "{interface}" to bond, '
+@@ -261,6 +302,11 @@ def verify(bond):
+             if not Ethtool(interface).check_bonding():
+                 raise ConfigError(error_msg + 'driver is not supported!')
+ 
++            if ask_offload and interface not in ('eth0', 'eth1', 'eth2', 'eth3', 'eth4'):
++                raise ConfigError(error_msg +
++                                  'only FMan ports eth0-eth4 can carry ASK2 '
++                                  'hardware offload!')
++
+     if 'primary' in bond:
+         if bond['primary'] not in bond['member']['interface']:
+             raise ConfigError(f'Primary interface of bond "{bond_name}" must be a member interface')
+@@ -295,6 +341,7 @@ def apply(bond):
+         dict_search('member.interface_remove', bond)
+         or 'static_arp' in bond
+         or 'vrf_changed' in bond
++        or 'offload_changed' in bond
+     ):
+         try:
+             call_dependents()
+diff --git a/src/conf_mode/system_conntrack.py b/src/conf_mode/system_conntrack.py
+index a639013c3..f809382f6 100644
+--- a/src/conf_mode/system_conntrack.py
++++ b/src/conf_mode/system_conntrack.py
+@@ -120,6 +120,16 @@ def get_config(config=None):
+             continue
+         conntrack['ask_auto_families'].update(
+             family for family in ('ipv4', 'ipv6') if family in (if_conf.get('offload') or {}))
++    # LS1046A ASK2 bond offload (Inc 4): same for offloaded bonds (the auto
++    # flowtable device is the bond master; conntrack state is device-agnostic).
++    for ifname, if_conf in conf.get_config_dict(['interfaces', 'bonding'],
++                                                key_mangling=('-', '_'),
++                                                get_first_key=True,
++                                                no_tag_node_value_mangle=True).items():
++        if ifname in user_ifaces or 'disable' in if_conf:
++            continue
++        conntrack['ask_auto_families'].update(
++            family for family in ('ipv4', 'ipv6') if family in (if_conf.get('offload') or {}))
+ 
+     # WireGuard data packets are encrypted and never offloaded, so tracking
+     # the outer UDP flow only costs cycles (conntrack, helper and firewall
