@@ -159,7 +159,8 @@ static void test_init_flow(struct ask_flow *f, u64 cookie,
 {
 	memset(f, 0, sizeof(*f));
 	f->cookie       = cookie;
-	f->hw_flow_id   = hw_id;
+	f->hw[0].hw_id  = hw_id;
+	f->n_hw         = 1;	/* single copy (Inc 2 vector shape) */
 	f->oif          = oif;
 	/*
 	 * Mark the flow HW-backed: ask_genl_fill_one_flow() only emits

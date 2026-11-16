@@ -588,7 +588,7 @@ goto nla_put_failure;
 if (nla_put_u8(skb, ASK_FLOW_ATTR_OFFLOADED, f->hw_backed ? 1 : 0))
 goto nla_put_failure;
 if (f->hw_backed &&
-    nla_put_u32(skb, ASK_FLOW_ATTR_HW_FLOW_ID, f->hw_flow_id))
+    nla_put_u32(skb, ASK_FLOW_ATTR_HW_FLOW_ID, f->hw[0].hw_id))
 goto nla_put_failure;
 if (nla_put_u32(skb, ASK_FLOW_ATTR_OIF, f->oif))
 goto nla_put_failure;

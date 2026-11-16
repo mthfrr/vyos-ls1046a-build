@@ -105,7 +105,7 @@ if (f) {
 KUNIT_EXPECT_EQ(test, f->cookie, 0xdeadbeefULL);
 KUNIT_EXPECT_EQ(test, f->oif, 7u);
 KUNIT_EXPECT_EQ(test, f->action_flags, (u32)ASK_ACT_TTL_DEC);
-KUNIT_EXPECT_EQ(test, f->hw_flow_id, hw_id);
+KUNIT_EXPECT_EQ(test, f->hw[0].hw_id, hw_id);
 }
 rcu_read_unlock();
 
@@ -391,12 +391,12 @@ rcu_read_lock();
 f = ask_flow_lookup(&t, 0xaaaa);
 KUNIT_EXPECT_NOT_NULL(test, f);
 if (f)
-KUNIT_EXPECT_EQ(test, f->hw_flow_id, hw_id_a);
+KUNIT_EXPECT_EQ(test, f->hw[0].hw_id, hw_id_a);
 
 f = ask_flow_lookup(&t, 0xbbbb);
 KUNIT_EXPECT_NOT_NULL(test, f);
 if (f)
-KUNIT_EXPECT_EQ(test, f->hw_flow_id, hw_id_b);
+KUNIT_EXPECT_EQ(test, f->hw[0].hw_id, hw_id_b);
 rcu_read_unlock();
 
 /*
@@ -532,14 +532,14 @@ f = ask_flow_lookup(&t, 0xc0de01);
 KUNIT_EXPECT_NOT_NULL(test, f);
 if (f) {
 /* Non-zero id ... */
-KUNIT_EXPECT_NE(test, f->hw_flow_id, 0u);
+KUNIT_EXPECT_NE(test, f->hw[0].hw_id, 0u);
 /* ... but definitively not hardware-backed. */
 KUNIT_EXPECT_FALSE(test, f->hw_backed);
 }
 f = ask_flow_lookup(&t, 0xc0de02);
 KUNIT_EXPECT_NOT_NULL(test, f);
 if (f) {
-KUNIT_EXPECT_NE(test, f->hw_flow_id, 0u);
+KUNIT_EXPECT_NE(test, f->hw[0].hw_id, 0u);
 KUNIT_EXPECT_FALSE(test, f->hw_backed);
 }
 rcu_read_unlock();
@@ -553,6 +553,45 @@ KUNIT_EXPECT_EQ(test, ask_flow_remove(&t, 0xc0de02), 0);
 KUNIT_EXPECT_EQ(test, atomic_read(&t.num_hw_backed), 0);
 
 ask_flow_table_destroy(&t);
+}
+
+/*
+ * Inc 2: copy-vector shape on the fallback path. A published entry always
+ * carries n_hw==1 (real cookie or fake id, port_id 0 on the legacy path);
+ * a not-hw_backed entry must report NO FE copies through ask_flow_snap_hw
+ * (the REPLACE/publish loops key their FE record install/withdraw on it).
+ * The >1 fan-out itself needs live bond netdevs + PCD => board suite.
+ */
+static void ask_flow_test_copy_vector_fallback_shape(struct kunit *test)
+{
+	struct ask_flow_table t;
+	struct ask_flow_key key;
+	struct ask_hw_copy copies[ASK_FLOW_MAX_INGRESS_COPIES];
+	struct ask_flow *f;
+	u32 hw_id = 0;
+
+	KUNIT_ASSERT_EQ(test, ask_flow_table_create(&t, "kunit-copyvec"), 0);
+
+	make_key_v4(&key, htonl(0x0a030001), htonl(0x0a030002),
+		    htons(13000), htons(443));
+	KUNIT_ASSERT_EQ(test,
+		ask_flow_insert(&t, 0xba0001, &key, 1, 0, ASK_HW_DIR_FWD,
+				&hw_id), 0);
+
+	rcu_read_lock();
+	f = ask_flow_lookup(&t, 0xba0001);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_EXPECT_FALSE(test, f->hw_backed);
+	KUNIT_EXPECT_EQ(test, (int)f->n_hw, 1);
+	KUNIT_EXPECT_EQ(test, (int)f->hw[0].port_id, 0);
+	rcu_read_unlock();
+
+	/* SW mirror => no FE records => the publish loops see zero copies. */
+	KUNIT_EXPECT_EQ(test, ask_flow_snap_hw(&t, 0xba0001, copies,
+					       ASK_FLOW_MAX_INGRESS_COPIES),
+			0u);
+	KUNIT_EXPECT_EQ(test, ask_flow_remove(&t, 0xba0001), 0);
+	ask_flow_table_destroy(&t);
 }
 
 /*
@@ -913,6 +952,7 @@ KUNIT_CASE(ask_flow_test_stress_walk),
 KUNIT_CASE(ask_flow_test_hw_fallback_insert_remove),
 KUNIT_CASE(ask_flow_test_hw_fallback_eexist_rollback),
 KUNIT_CASE(ask_flow_test_sw_fallback_not_hw_backed),
+KUNIT_CASE(ask_flow_test_copy_vector_fallback_shape),
 KUNIT_CASE(ask_flow_test_flush_is_remove_equivalent),
 KUNIT_CASE(ask_flow_test_default_table_unused_until_init),
 KUNIT_CASE(ask_flow_test_gen_monotonic),

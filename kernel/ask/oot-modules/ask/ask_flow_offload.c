@@ -1064,6 +1064,8 @@ struct ask_neigh_mac_fixup {
 	u32                 action_flags;
 	u8                  dir;
 	u64                 generation; /* A3: owner stamp snapshotted at collect */
+	struct ask_hw_copy  copies[ASK_FLOW_MAX_INGRESS_COPIES]; /* Inc 2 */
+	unsigned int        n_copies;
 };
 
 /*
@@ -1112,6 +1114,9 @@ static int ask_neigh_mac_collect(struct ask_flow *f, void *arg)
 	fx->action_flags = f->action_flags;
 	fx->dir          = f->dir;
 	fx->generation   = f->generation;
+	fx->n_copies     = min_t(unsigned int, f->n_hw,
+				 ASK_FLOW_MAX_INGRESS_COPIES);
+	memcpy(fx->copies, f->hw, fx->n_copies * sizeof(fx->copies[0]));
 	list_add_tail(&fx->node, &ctx->fixups);
 	ctx->matched++;
 	return 0;
@@ -1191,22 +1196,52 @@ static int ask_flow_fe_owner_status(struct ask_flow_table *t, u64 cookie,
 static int ask_flow_withdraw_owned(struct ask_flow_table *t, u64 cookie,
 				   u64 generation, u64 fe_token,
 				   const struct ask_flow_key *key,
+				   const struct ask_hw_copy *copies,
+				   unsigned int n_copies,
 				   bool hw_backed, const char *what,
 				   bool *superseded)
 {
-	int rc;
-
 	lockdep_assert_held(&ask_flow_lifecycle_lock);
 	if (superseded)
 		*superseded = false;
 	if (!fe_token || !key)
 		return -EINVAL;
 	if (hw_backed) {
-		rc = ask_fe_flow_remove_retain(key, cookie, fe_token, what);
-		if (rc && rc != -ESTALE)
-			return rc;
+		/*
+		 * Inc 2: retire EVERY ingress copy (D3/D4). The vector is
+		 * authoritative for the record's ingress port: a legacy
+		 * single-copy flow stored copies[0].port_id == key.port_id
+		 * (so overriding it is a no-op there), while a bond flow's
+		 * key.port_id is 0 — not overriding would delete from the
+		 * wrong table. n_copies==0 (vector not captured) keeps the
+		 * pure legacy single-record withdrawal. All copies are
+		 * attempted even after one fails -- an early return would
+		 * leak the unattempted ones; the worst per-copy result then
+		 * decides (quarantine/hard error dominates -ESTALE, matching
+		 * the legacy single-copy contract).
+		 */
+		unsigned int i, n = n_copies ? n_copies : 1;
+		int worst = 0;
+
+		for (i = 0; i < n; i++) {
+			struct ask_flow_key kc = *key;
+			int rrc;
+
+			if (n_copies)
+				kc.port_id = copies[i].port_id;
+			rrc = ask_fe_flow_remove_retain(&kc, cookie, fe_token,
+							what);
+			if (rrc == -EAGAIN)
+				worst = -EAGAIN;		/* quarantine wins */
+			else if (rrc && rrc != -ESTALE && worst != -EAGAIN)
+				worst = rrc;
+			else if (rrc == -ESTALE && !worst)
+				worst = -ESTALE;
+		}
+		if (worst && worst != -ESTALE)
+			return worst;
 		if (superseded)
-			*superseded = rc == -ESTALE;
+			*superseded = worst == -ESTALE;
 	}
 	return ask_flow_remove_owned_identified(t, cookie, generation, fe_token);
 }
@@ -1224,6 +1259,8 @@ static int ask_neigh_republish(struct ask_flow_table *t, u64 cookie,
 {
 	struct ask_flow *cur;
 	bool hw_backed = false;
+	struct ask_hw_copy copies[ASK_FLOW_MAX_INGRESS_COPIES];
+	unsigned int n_copies = 0, ci;
 	u32 hw_id = 0;
 	u64 fe_token = 0;
 	int rc;
@@ -1237,9 +1274,15 @@ static int ask_neigh_republish(struct ask_flow_table *t, u64 cookie,
 
 	rcu_read_lock();
 	cur = ask_flow_lookup(t, cookie);
-	if (cur && cur->fe_token == fe_token)
+	if (cur && cur->fe_token == fe_token) {
 		hw_backed = cur->hw_backed;
-	else
+		if (hw_backed) {	/* Inc 2: snapshot the copy set */
+			n_copies = min_t(unsigned int, cur->n_hw,
+					 ASK_FLOW_MAX_INGRESS_COPIES);
+			memcpy(copies, cur->hw,
+			       n_copies * sizeof(copies[0]));
+		}
+	} else
 		rc = -ESTALE;
 	rcu_read_unlock();
 	if (rc)
@@ -1252,10 +1295,20 @@ static int ask_neigh_republish(struct ask_flow_table *t, u64 cookie,
 						       fe_token);
 		return -ESTALE;
 	}
-	rc = ask_flow_fe_install(key, hw_id, NULL, cookie, fe_token);
+	for (ci = 0; ci < n_copies; ci++) {
+		struct ask_flow_key kc = *key;
+
+		kc.port_id = copies[ci].port_id;	/* == key->port_id
+						     * for a single copy */
+		rc = ask_flow_fe_install(&kc, copies[ci].hw_id, NULL, cookie,
+					 fe_token);
+		if (rc)
+			break;
+	}
 	if (rc) {
 		int wrc = ask_flow_withdraw_owned(t, cookie, generation,
-						  fe_token, key, hw_backed,
+						  fe_token, key, copies,
+						  n_copies, hw_backed,
 						  "neigh republish rollback",
 						  NULL);
 
@@ -1266,8 +1319,8 @@ static int ask_neigh_republish(struct ask_flow_table *t, u64 cookie,
 	if (!ask_flow_gen_is_current(t, cookie, generation) ||
 	    !ask_flow_token_is_current(t, cookie, fe_token)) {
 		rc = ask_flow_withdraw_owned(t, cookie, generation, fe_token,
-					     key, true, "stale republish",
-					     NULL);
+					     key, copies, n_copies, true,
+					     "stale republish", NULL);
 		if (rc && rc != -ENOENT && rc != -ESTALE)
 			return rc;
 		return -ESTALE;
@@ -1315,6 +1368,8 @@ void ask_flow_neigh_mac_changed(struct net_device *dev, const u8 *dst_ip,
 	list_for_each_entry_safe(fx, tmp, &ctx.fixups, node) {
 		struct ask_flow *cur;
 		struct ask_flow_key old_key;
+		struct ask_hw_copy old_copies[ASK_FLOW_MAX_INGRESS_COPIES];
+		unsigned int n_old = 0;
 		bool snapshot_ok = false;
 		bool hw_backed = false;
 		bool replaced;
@@ -1326,6 +1381,12 @@ void ask_flow_neigh_mac_changed(struct net_device *dev, const u8 *dst_ip,
 		    cur->fe_token == fx->fe_token) {
 			old_key = cur->key;
 			hw_backed = cur->hw_backed;
+			if (hw_backed) {	/* Inc 2: current copy set */
+				n_old = min_t(unsigned int, cur->n_hw,
+					      ASK_FLOW_MAX_INGRESS_COPIES);
+				memcpy(old_copies, cur->hw,
+				       n_old * sizeof(old_copies[0]));
+			}
 			snapshot_ok = true;
 		}
 		rcu_read_unlock();
@@ -1351,7 +1412,8 @@ void ask_flow_neigh_mac_changed(struct net_device *dev, const u8 *dst_ip,
 		/* Preserve the software owner and hardware cookie if FE
 		 * withdrawal is uncertain. */
 		rc = ask_flow_withdraw_owned(t, fx->cookie, fx->generation,
-					     fx->fe_token, &old_key, hw_backed,
+					     fx->fe_token, &old_key,
+					     old_copies, n_old, hw_backed,
 					     "neigh stale-MAC", NULL);
 		if (rc)
 			goto neigh_next;
@@ -3367,6 +3429,8 @@ struct ask_flush_victim {
 	u64 generation;
 	bool hw_backed;
 	struct ask_flow_key key;
+	struct ask_hw_copy copies[ASK_FLOW_MAX_INGRESS_COPIES]; /* Inc 2 */
+	unsigned int n_copies;
 };
 
 static int ask_collect_flush_victim(struct ask_flow *f, void *arg)
@@ -3384,6 +3448,9 @@ static int ask_collect_flush_victim(struct ask_flow *f, void *arg)
 	v->generation = f->generation;
 	v->hw_backed = f->hw_backed;
 	v->key = f->key;
+	v->n_copies = min_t(unsigned int, f->n_hw,
+			    ASK_FLOW_MAX_INGRESS_COPIES);
+	memcpy(v->copies, f->hw, v->n_copies * sizeof(v->copies[0]));
 	list_add_tail(&v->node, arg);
 	return 0;
 }
@@ -3454,7 +3521,8 @@ static int __ask_flow_flush_matching(int (*collect)(struct ask_flow *, void *),
 		}
 		ask_flow_pending_drop_cookie(v->cookie, v->generation);
 		rc = ask_flow_withdraw_owned(t, v->cookie, v->generation,
-					     v->fe_token, &v->key, v->hw_backed,
+					     v->fe_token, &v->key, v->copies,
+					     v->n_copies, v->hw_backed,
 					     what,
 					     lifecycle_locked ? &superseded : NULL);
 		if (identity_lost && superseded)
@@ -4130,6 +4198,8 @@ static int ask_flow_offload_replace(struct net_device *ingress_dev,
 	bool is_v6;
 	bool defer_nh;
 	u32 hw_id = 0;
+	struct ask_hw_copy copies[ASK_FLOW_MAX_INGRESS_COPIES];
+	unsigned int n_copies = 0, ci;
 	u32 action_flags = 0;
 	u32 oif = 0;
 	u64 generation;
@@ -4966,6 +5036,40 @@ static int ask_flow_offload_replace(struct net_device *ingress_dev,
 						dev_put(true_iif_dev);
 					return prc;
 				}
+			} else if (prc == -ENODEV &&
+				   netif_is_bond_master(bind_dev)) {
+				/*
+				 * Inc 2 (D4): bond ingress. Arm each
+				 * eligible member's FE pipeline now (bind is
+				 * idempotent); the record copies themselves
+				 * are fanned out by ask_flow_insert_core(),
+				 * which enumerates the SAME eligibility
+				 * predicate (ask_bond_ingress_copies).
+				 * key.port_id deliberately stays 0: the bond
+				 * is not a port; per-record ports live in
+				 * the flow's hw[] copy set. A bn==1 result
+				 * with ports[0]==0 means "no eligible
+				 * member" (legacy pre-Inc-2 path) -> skip.
+				 * F-262 MTU: bonding enforces one MTU on all
+				 * members, so the bond's own MTU fits every
+				 * copy.
+				 */
+				u8 bports[ASK_FLOW_MAX_INGRESS_COPIES];
+				unsigned int bn, bi;
+				u16 emtu = ask_flow_cookie_mtu(f->cookie);
+
+				bn = ask_bond_ingress_copies(&key, bports,
+							     ASK_FLOW_MAX_INGRESS_COPIES);
+				if (bports[0]) {	/* real ports named;
+						     * bports[0]==0 would be
+						     * the legacy fallback */
+					for (bi = 0; bi < bn; bi++)
+						(void)ask_hw_port_bind(bports[bi],
+								       ASK_HW_DIR_FWD,
+								       bind_dev);
+					if (emtu && emtu < bind_dev->mtu)
+						key.egress_mtu = emtu;
+				}
 			} else if (prc != -ENODEV && prc != -ERANGE) {
 				ask_pr_dbg("flow_offload: REPLACE port-id resolve(%s) failed: %d\n",
 					   netdev_name(bind_dev), prc);
@@ -5055,11 +5159,26 @@ static int ask_flow_offload_replace(struct net_device *ingress_dev,
 		return rc == -ESTALE ? 0 : rc;
 	}
 	/* Keep offload ownership transactional: only keep the flow in the
-	 * HW-backed table if the FE-VM record was actually installed. */
-	rc = ask_flow_fe_install(&key, hw_id, egress_dev, f->cookie, fe_token);
+	 * HW-backed table if the FE-VM record was actually installed.
+	 * Inc 2: a bond ingress publishes one record per copied port; the
+	 * copy set is the one ask_flow_insert_core() published (entry is
+	 * ours — lifecycle lock held since before the insert). */
+	n_copies = ask_flow_snap_hw(t, (u64)f->cookie, copies,
+				    ASK_FLOW_MAX_INGRESS_COPIES);
+	for (ci = 0; ci < n_copies; ci++) {
+		struct ask_flow_key kc = key;
+
+		kc.port_id = copies[ci].port_id;	/* == key.port_id for
+						     * a single copy */
+		rc = ask_flow_fe_install(&kc, copies[ci].hw_id, egress_dev,
+					 f->cookie, fe_token);
+		if (rc)
+			break;
+	}
 	if (rc) {
 		int rrc = ask_flow_withdraw_owned(t, (u64)f->cookie, generation,
-						  fe_token, &key, true,
+						  fe_token, &key, copies,
+						  n_copies, true,
 						  "REPLACE rollback", NULL);
 
 		ask_pr_warn("flow_offload: REPLACE rollback cookie=0x%lx fe_flow_insert=%d\n",
@@ -5080,7 +5199,8 @@ static int ask_flow_offload_replace(struct net_device *ingress_dev,
 	if (!ask_flow_gen_is_current(t, (u64)f->cookie, generation) ||
 	    !ask_flow_token_is_current(t, (u64)f->cookie, fe_token)) {
 		rc = ask_flow_withdraw_owned(t, (u64)f->cookie, generation,
-					     fe_token, &key, true, "stale REPLACE",
+					     fe_token, &key, copies, n_copies,
+					     true, "stale REPLACE",
 					     NULL);
 		if (rc && rc != -ENOENT && rc != -ESTALE)
 			return -EINPROGRESS;
@@ -5146,6 +5266,8 @@ static int ask_flow_offload_destroy(struct flow_cls_offload *f)
 	{
 		struct ask_flow *fl;
 		struct ask_flow_key dkey;
+		struct ask_hw_copy dcopy[ASK_FLOW_MAX_INGRESS_COPIES];
+		unsigned int n_dcopy = 0;
 		u64 fe_token = 0;
 		u64 flow_gen = 0;
 		bool have_key = false;
@@ -5158,6 +5280,12 @@ static int ask_flow_offload_destroy(struct flow_cls_offload *f)
 			dkey = fl->key;
 			fe_token = fl->fe_token;
 			hw_backed = fl->hw_backed;
+			if (hw_backed) {	/* Inc 2: FE copy set */
+				n_dcopy = min_t(unsigned int, fl->n_hw,
+						ASK_FLOW_MAX_INGRESS_COPIES);
+				memcpy(dcopy, fl->hw,
+				       n_dcopy * sizeof(dcopy[0]));
+			}
 			have_key = true;
 		}
 		rcu_read_unlock();
@@ -5183,7 +5311,8 @@ static int ask_flow_offload_destroy(struct flow_cls_offload *f)
 		/* Do not release the software owner or its hardware cookie
 		 * until the identified FE deletion has settled. */
 		rc = ask_flow_withdraw_owned(t, (u64)f->cookie, destroy_gen,
-					     fe_token, &dkey, hw_backed, "DESTROY",
+					     fe_token, &dkey, dcopy, n_dcopy,
+					     hw_backed, "DESTROY",
 					     NULL);
 		if (rc == -ENOENT) {
 			if (READ_ONCE(ask_f266_trace))
@@ -5311,6 +5440,8 @@ static bool ask_fe_flow_refresh_hw_stats(struct ask_flow_table *t, u64 cookie,
 	u8 kbuf[ASK_FE_KEY_SIZE_DUAL];
 	u64 hw_pkts = 0, hw_bytes = 0;
 	struct ask_flow *fl;
+	struct ask_hw_copy copies[ASK_FLOW_MAX_INGRESS_COPIES];
+	unsigned int n_copies = 0, ci;
 	struct fman *fm;
 	u64 generation, fe_token;
 	bool cached;
@@ -5331,23 +5462,46 @@ static bool ask_fe_flow_refresh_hw_stats(struct ask_flow_table *t, u64 cookie,
 	port_id = fl->key.port_id;
 	generation = fl->generation;
 	fe_token = fl->fe_token;
-	cached = ask_stats_scan_fresh(fl, &hw_pkts, &hw_bytes);
+	n_copies = min_t(unsigned int, fl->n_hw,
+			 ASK_FLOW_MAX_INGRESS_COPIES);
+	memcpy(copies, fl->hw, n_copies * sizeof(copies[0]));
+	/* Inc 2: the batched F-315 scan cache is one slot fed per record
+	 * by fe_token; with >1 copies it reports one arbitrary copy.
+	 * Ponytail ceiling: scan stays single-record; multi-copy flows
+	 * pay the per-flow direct read instead. Upgrade path: per-port
+	 * scan slots in struct ask_flow. */
+	cached = n_copies <= 1 &&
+		 ask_stats_scan_fresh(fl, &hw_pkts, &hw_bytes);
 	rcu_read_unlock();
 
 	/* F-315: the per-flow read only when the batched scan has not
-	 * reported this record within ASK_STATS_SCAN_FRESH. */
+	 * reported this record within ASK_STATS_SCAN_FRESH.
+	 * Inc 2: sum every ingress copy (PLAN item 4). */
 	if (!cached) {
+		u64 sum_pkts = 0, sum_bytes = 0;
+
 		fm = ask_hw_get_fman();
 		if (!fm)
 			return false;
 
-		ask_fe_build_key_dual(&key, kbuf);
-		if (fman_pcd_fe_flow_get_stats_identified(fm, port_id, kbuf,
-							  ASK_FE_KEY_SIZE_DUAL,
-							  FMAN_PCD_FE_OWNER_ASK,
-							  fe_token, &hw_pkts,
-							  &hw_bytes, NULL) != 0)
-			return false;
+		for (ci = 0; ci < n_copies; ci++) {
+			struct ask_flow_key kc = key;
+			u64 pkts_c = 0, bytes_c = 0;
+
+			kc.port_id = copies[ci].port_id;
+			ask_fe_build_key_dual(&kc, kbuf);
+			if (fman_pcd_fe_flow_get_stats_identified(fm,
+				    copies[ci].port_id, kbuf,
+				    ASK_FE_KEY_SIZE_DUAL,
+				    FMAN_PCD_FE_OWNER_ASK,
+				    fe_token, &pkts_c, &bytes_c,
+				    NULL) != 0)
+				return false;
+			sum_pkts += pkts_c;
+			sum_bytes += bytes_c;
+		}
+		hw_pkts = sum_pkts;
+		hw_bytes = sum_bytes;
 	}
 
 	/*

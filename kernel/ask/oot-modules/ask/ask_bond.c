@@ -116,3 +116,78 @@ int ask_bond_select_egress(const struct ask_flow_key *key,
 
 	return s.ifindex[ask_bond_hash_index(key, s.n)];
 }
+
+/*
+ * Ingress copy enumeration (D4): one FE record per ENGAGED member port,
+ * each in that port's own ehash table (F-220), because conntrack's
+ * iifidx collapses the arrival slave to the bond and the record cannot
+ * be keyed to "the" ingress slave. Eligibility = egress eligibility
+ * (enslaved, running, carrier) AND a dpaa-backed port AND that port's
+ * family mask admits this flow (exactly ask_hw_flow_family_ok(), the
+ * same predicate preflight applies -- a port that fails it here would
+ * only fail again there). Order = lower-list order; a cap overflow just
+ * leaves the remaining members SW-only (deterministic).
+ *
+ * Returns 1 with *ports == 0 ("legacy single, resolve from key->iif")
+ * for a non-bond ingress OR a bond with no eligible member -- the latter
+ * keeps the pre-Inc-2 -ENODEV -> SW-fallback behaviour byte-identical.
+ */
+struct ask_bond_ing {
+	u8 *ports;
+	unsigned int max;
+	unsigned int n;
+	const struct ask_flow_key *key;
+};
+
+static int ask_bond_eligible_ingress_lower(struct net_device *lower,
+					   struct netdev_nested_priv *priv)
+{
+	struct ask_bond_ing *ing = priv->data;
+	u8 pid;
+
+	if (!netif_is_bond_slave(lower) || !netif_running(lower) ||
+	    !netif_carrier_ok(lower))
+		return 0;
+	if (ing->n == ing->max)		/* cap reached; rest stay SW-only */
+		return 1;
+	if (ask_hw_dev_port(lower, &pid))	/* not dpaa-backed */
+		return 0;
+	if (ask_hw_flow_family_ok(pid, ing->key))
+		return 0;
+	ing->ports[ing->n++] = pid;
+	return 0;
+}
+
+unsigned int ask_bond_ingress_copies(const struct ask_flow_key *key,
+				     u8 *ports, unsigned int max)
+{
+	struct net_device *dev;
+	struct ask_bond_ing ing = { .ports = ports, .max = max, .key = key };
+	struct netdev_nested_priv priv = { .data = &ing };
+
+	if (!key || !ports || !max)
+		return 0;
+
+	dev = key->iif ? dev_get_by_index(&init_net, key->iif) : NULL;
+	if (!dev) {
+		ports[0] = 0;
+		return 1;		/* legacy path; iif unresolvable */
+	}
+
+	if (netif_is_bond_master(dev)) {
+		rcu_read_lock();
+		netdev_walk_all_lower_dev_rcu(dev,
+					      ask_bond_eligible_ingress_lower,
+					      &priv);
+		rcu_read_unlock();
+	}
+	dev_put(dev);
+
+	if (!ing.n) {
+		ports[0] = 0;		/* non-bond, or no eligible member:
+					 * legacy single path (pre-Inc-2
+					 * bond behaviour unchanged) */
+		return 1;
+	}
+	return ing.n;
+}

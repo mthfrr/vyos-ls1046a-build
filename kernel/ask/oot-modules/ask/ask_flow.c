@@ -410,6 +410,8 @@ int rc;
 u32 hw_id = 0;
 u64 fe_token = 0;
 bool hw_inserted = false;
+u8 ingress_ports[ASK_FLOW_MAX_INGRESS_COPIES];
+unsigned int need;
 
 if (!t || !key || !out_hw_id)
 return -EINVAL;
@@ -417,7 +419,17 @@ return -EINVAL;
 if (dir >= ASK_HW_DIR_NR)
 return -EINVAL;
 
-if (ask_max_flows && (u32)atomic_read(&t->num_flows) >= ask_max_flows) {
+/*
+ * Inc 2 (D4/Q1): a bond ingress fans out to one FE record per engaged
+ * member port; those copies are real records and count against the
+ * admission budget. For every other ingress need == 1, making the gate
+ * below numerically identical to the legacy `>= ask_max_flows`.
+ */
+need = ask_bond_ingress_copies(key, ingress_ports,
+			       ASK_FLOW_MAX_INGRESS_COPIES);
+
+if (ask_max_flows &&
+    (u32)atomic_read(&t->num_flows) + need > ask_max_flows) {
 atomic_inc(&ask_flow_overflow);
 pr_info_ratelimited("ask: flow: admission budget %u reached, cookie=0x%llx stays in software\n",
     ask_max_flows, cookie);
@@ -519,12 +531,56 @@ u64_stats_init(&f->stats.syncp);
  * contract: -ENODEV/-EOPNOTSUPP become SW-only mirrors, -EAGAIN parks on the
  * pending queue, and -ENOSPC/-ENOMEM are hard "stay in kernel SW" failures.
  */
-rc = ask_hw_flow_preflight(key, oif, action_flags, dir);
-if (!rc)
-rc = ask_hw_flow_insert(key, oif, action_flags, dir, &hw_id);
+/*
+ * Inc 2 (D4): bond ingress — one FE record copy per engaged member
+ * port, each in that port's own ehash table (F-220), because conntrack's
+ * iifidx collapses the arrival slave to the bond. ingress_ports[0] != 0
+ * means the enumeration NAMED real ports (a degraded bond with a single
+ * eligible member fans out exactly that one record); 0 means the legacy
+ * single path. A copy that fails admits only itself to software (D5);
+ * if ALL fail, the first copy's rc drives the legacy dispatch
+ * below so the caller contract (-ENODEV/-EOPNOTSUPP SW-mirror,
+ * -EAGAIN pending, hard errors propagate) is unchanged.
+ */
+if (ingress_ports[0]) {
+	unsigned int i;
+	int first_rc = 0;
+
+	for (i = 0; i < need; i++) {
+		struct ask_flow_key kc = *key;
+		u32 id = 0;
+		int arc;
+
+		kc.port_id = ingress_ports[i];	/* FE ehash key byte 0 */
+		arc = ask_hw_flow_preflight_port(&kc, oif, action_flags,
+						 dir, ingress_ports[i]);
+		if (!arc)
+			arc = ask_hw_flow_insert_port(&kc, oif, action_flags,
+						      dir, ingress_ports[i],
+						      &id);
+		if (!arc) {
+			f->hw[f->n_hw].port_id = ingress_ports[i];
+			f->hw[f->n_hw].hw_id   = id;
+			f->n_hw++;
+		} else if (i == 0) {
+			first_rc = arc;
+		}
+	}
+	if (f->n_hw) {
+		hw_id = f->hw[0].hw_id;
+		rc = 0;
+	} else {
+		hw_id = 0;
+		rc = first_rc;
+	}
+} else {
+	rc = ask_hw_flow_preflight(key, oif, action_flags, dir);
+	if (!rc)
+	rc = ask_hw_flow_insert(key, oif, action_flags, dir, &hw_id);
 else
 pr_info_ratelimited("ask: flow: resource preflight cookie=0x%llx rc=%d — no HW mutation\n",
     cookie, rc);
+}
 if (rc == 0) {
 hw_inserted = true;
 pr_info_ratelimited("ask: flow: hw_insert OK cookie=0x%llx oif=%u hw_id=0x%08x\n",
@@ -587,7 +643,11 @@ ask_pr_warn("flow: hw_insert(cookie=0x%llx) hard fail %d\n",
 kfree(f);
 return rc;
 }
-f->hw_flow_id = hw_id;
+if (!f->n_hw) {	/* single copy (real id or SW-fallback fake id) */
+	f->hw[0].hw_id   = hw_id;
+	f->hw[0].port_id = key->port_id;	/* 0 on legacy/SW paths */
+	f->n_hw          = 1;
+}
 f->hw_backed  = hw_inserted;
 f->generation = generation;
 
@@ -608,11 +668,15 @@ f->generation = generation;
 if (generation != 0 &&
     !ask_flow_gen_is_current(t, cookie, generation)) {
 if (hw_inserted) {
-int rm_rc = ask_hw_flow_remove(hw_id);
+unsigned int ci;
 
-if (rm_rc && rm_rc != -ENODEV)
-ask_pr_warn("flow: stale-publish HW rollback (cookie=0x%llx gen=%llu) rc=%d\n",
-    cookie, generation, rm_rc);
+	for (ci = 0; ci < f->n_hw; ci++) {
+		int rm_rc = ask_hw_flow_remove(f->hw[ci].hw_id);
+
+		if (rm_rc && rm_rc != -ENODEV)
+			ask_pr_warn("flow: stale-publish HW rollback (cookie=0x%llx gen=%llu copy=%u) rc=%d\n",
+				    cookie, generation, ci, rm_rc);
+	}
 }
 kfree(f);
 pr_info_ratelimited("ask: flow: REPLACE cookie=0x%llx gen=%llu superseded before publish — not offloaded\n",
@@ -718,7 +782,8 @@ static int ask_flow_remove_core(struct ask_flow_table *t, u64 cookie,
 u64 generation, bool honor_generation, u64 fe_token)
 {
 struct ask_flow *f;
-u32 hw_id;
+struct ask_hw_copy hw[ASK_FLOW_MAX_INGRESS_COPIES];
+u8 n_hw;
 bool hw_backed;
 int rc;
 
@@ -755,7 +820,7 @@ pr_info_ratelimited("ask: flow: stale DESTROY cookie=0x%llx gen=%llu < live gen=
 return -ESTALE;
 }
 /*
- * Snapshot hw_flow_id + hw_backed BEFORE the rht unlink so we can
+ * Snapshot the FE copy set + hw_backed BEFORE the rht unlink so we can
  * hand them to ask_hw_flow_remove() after the SW table no longer
  * references the entry. Both fields are set once at insert time and
  * never mutated, so reading them under rcu_read_lock is safe.
@@ -766,7 +831,8 @@ return -ESTALE;
  * lookup that already obtained the pointer drains through a
  * grace period before the kfree fires.
  */
-hw_id     = f->hw_flow_id;
+memcpy(hw, f->hw, sizeof(hw));
+n_hw      = f->n_hw;
 hw_backed = f->hw_backed;
 rc = rhashtable_remove_fast(&t->rht, &f->node, ask_flow_rht_params);
 rcu_read_unlock();
@@ -796,12 +862,16 @@ return rc;
  * leak the SW entry.
  */
 if (hw_backed) {
-int rm_rc = ask_hw_flow_remove(hw_id);
+unsigned int ci;
 
-if (rm_rc && rm_rc != -ENODEV)
-ask_pr_warn("flow: hw_remove(cookie=0x%llx hw_id=0x%08x) %d\n",
-    cookie, hw_id, rm_rc);
-atomic_dec(&t->num_hw_backed);
+	for (ci = 0; ci < n_hw; ci++) {
+		int rm_rc = ask_hw_flow_remove(hw[ci].hw_id);
+
+		if (rm_rc && rm_rc != -ENODEV)
+			ask_pr_warn("flow: hw_remove(cookie=0x%llx copy=%u/%u hw_id=0x%08x) %d\n",
+				    cookie, ci, n_hw, hw[ci].hw_id, rm_rc);
+	}
+	atomic_dec(&t->num_hw_backed);
 }
 
 atomic_dec(&t->num_flows);
@@ -816,6 +886,35 @@ int ask_flow_remove(struct ask_flow_table *t, u64 cookie)
 return ask_flow_remove_core(t, cookie, 0, false, 0);
 }
 EXPORT_SYMBOL_GPL(ask_flow_remove);
+
+/*
+ * Inc 2: snapshot of a live entry's FE copy set for the publish/withdraw
+ * loops in ask_flow_offload.c (they need each record's ingress port to
+ * rebuild the per-copy FE key). 0 = no FE records (absent, or
+ * SW-fallback: hw_backed==false means "never programmed silicon").
+ * Safe under rcu only because hw[]/n_hw are insert-once (see
+ * struct ask_flow).
+ */
+unsigned int ask_flow_snap_hw(struct ask_flow_table *t, u64 cookie,
+			      struct ask_hw_copy *out, unsigned int max)
+{
+	struct ask_flow *f;
+	unsigned int n = 0;
+
+	if (!t || !out || !max)
+		return 0;
+	rcu_read_lock();
+	f = ask_flow_lookup(t, cookie);
+	if (f && f->hw_backed) {
+		n = min_t(unsigned int, f->n_hw, max);
+		memcpy(out, f->hw, n * sizeof(*out));
+	}
+	rcu_read_unlock();
+	return n;
+}
+#ifdef ASK_KUNIT_EXPORTS
+EXPORT_SYMBOL_GPL(ask_flow_snap_hw);
+#endif
 
 int ask_flow_remove_owned(struct ask_flow_table *t, u64 cookie,
   u64 generation)

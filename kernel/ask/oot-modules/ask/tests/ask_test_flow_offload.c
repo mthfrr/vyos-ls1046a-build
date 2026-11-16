@@ -251,7 +251,7 @@ fl = ask_flow_lookup(t, 0xCAFE01);
 KUNIT_EXPECT_NOT_NULL(test, fl);
 if (fl) {
 KUNIT_EXPECT_EQ(test, (int)fl->oif, 17);
-KUNIT_EXPECT_NE(test, fl->hw_flow_id, 0u);
+KUNIT_EXPECT_NE(test, fl->hw[0].hw_id, 0u);
 }
 
 destroy_cookie(0xCAFE01);

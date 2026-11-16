@@ -436,6 +436,16 @@ struct ask_flow_key;
 u32 ask_bond_hash_index(const struct ask_flow_key *key, unsigned int n);
 int  ask_bond_select_egress(const struct ask_flow_key *key,
 			    struct net_device *bond);
+/*
+ * Ingress copy enumeration (D4): if key->iif names a bond master, fill
+ * @ports (max @max) with the FMan hwport ids of the eligible member
+ * ports (enslaved, running, carrier, dpaa-backed, family-engaged);
+ * returns that count. Otherwise (or when the bond has no eligible
+ * member) returns 1 with ports[0] == 0, meaning "the legacy single-record
+ * path, ingress resolved from key->iif".
+ */
+unsigned int ask_bond_ingress_copies(const struct ask_flow_key *key,
+				     u8 *ports, unsigned int max);
 
 /*
  * T-M6-A4 preflight: validate every resource class the current flow requires
@@ -448,6 +458,21 @@ int  ask_bond_select_egress(const struct ask_flow_key *key,
 int  ask_hw_flow_preflight(const struct ask_flow_key *key,
                            u32 oif, u32 action_flags,
                            enum ask_hw_dir dir);
+/*
+ * Inc 2: explicit-ingress-port variants. Identical contracts, but the
+ * caller supplies the ingress hwport id instead of it being resolved
+ * from key->iif — needed for bond ingress, where key->iif names the
+ * bond (no FMan port) and each record copy is steered to one member
+ * port's ehash table. key->port_id MUST be set to @port_id by the
+ * caller (it is FE ehash key byte 0, F-163).
+ */
+int  ask_hw_flow_preflight_port(const struct ask_flow_key *key,
+				u32 oif, u32 action_flags,
+				enum ask_hw_dir dir, u8 port_id);
+int  ask_hw_flow_insert_port(const struct ask_flow_key *key,
+			     u32 oif, u32 action_flags,
+			     enum ask_hw_dir dir, u8 port_id,
+			     u32 *out_hw_id);
 int  ask_hw_flow_family_ok(u8 hw_port_id, const struct ask_flow_key *key);
 int ask_hw_flow_policy_snapshot(u64 *seq);
 bool ask_hw_flow_policy_current(const struct ask_flow_key *key);
@@ -867,13 +892,33 @@ static inline int ask_intent_add_vlan(struct ask_flow_intent *in,
 int ask_intent_lower(const struct ask_flow_intent *in,
 		     u32 *out_oif, u32 *out_action_flags);
 
+struct ask_hw_copy {
+u8 port_id;	/* ingress FMan hwport id (per-port FE ehash table selector) */
+u32 hw_id;	/* xarray cookie when real; fake SW counter when not */
+};
+
+/* Inc 2 (D4): one ingress FE record per engaged bond member; records
+ * beyond the cap simply stay in software for those ports. */
+#define ASK_FLOW_MAX_INGRESS_COPIES 4
+
 struct ask_flow {
 struct rhash_head node;
 struct rcu_head rcu;
 u64 cookie;
 u64 fe_token;
 struct ask_flow_key key;
-u32 hw_flow_id;
+/*
+ * Inc 2: FE ingress record copy set. Normally n_hw==1 (hw[0]) —
+ * identical to the legacy single hw_flow_id. A bond ingress carries
+ * one record per engaged member port (D4), each in that port's own
+ * per-port ehash table (F-220). A hw_backed==false entry carries the
+ * legacy SW-fallback counter in hw[0].hw_id with port_id 0; its
+ * n_hw is still 1 so dumps keep showing an id exactly as before.
+ * Insert-once, immutable; safe to read under rcu_read_lock()
+ * alongside hw_backed (same lifetime rules as the old hw_flow_id).
+ */
+struct ask_hw_copy hw[ASK_FLOW_MAX_INGRESS_COPIES];
+u8 n_hw;
 u32 oif;
 u32 action_flags;
 /*
@@ -1028,6 +1073,13 @@ int ask_flow_insert(struct ask_flow_table *t,
 /* Remove a legacy, non-tokenized flow by cookie. Tokenized FE owners must use
  * the identified lifecycle path and return -EBUSY to this legacy API. */
 int ask_flow_remove(struct ask_flow_table *t, u64 cookie);
+/*
+ * Inc 2: snapshot the published copy set of a live entry (port ids for
+ * FE-record withdrawal/install loops). Returns the count copied (0 when
+ * absent or not hw_backed — a SW-fallback entry has no FE records).
+ */
+unsigned int ask_flow_snap_hw(struct ask_flow_table *t, u64 cookie,
+			      struct ask_hw_copy *out, unsigned int max);
 
 /*
  * T-M6-A3 generation-aware variants used by the production REPLACE/DESTROY and

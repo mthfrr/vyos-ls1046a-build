@@ -2322,9 +2322,29 @@ int ask_hw_flow_preflight(const struct ask_flow_key *key,
 			  u32 oif, u32 action_flags,
 			  enum ask_hw_dir dir)
 {
+	u8 port_id;
+	int rc;
+
+	if (!key)
+		return -EINVAL;
+
+	/* Ingress hwport must resolve first (it owns the classifier AND its
+	 * per-port family mask decides v4/v6 admission). Resolve BEFORE the
+	 * family gate so admission is by TRUE INGRESS PORT, address-independent. */
+	rc = ask_hw_resolve_iif_port(key->iif, &port_id);
+	if (rc)
+		return rc;
+
+	return ask_hw_flow_preflight_port(key, oif, action_flags, dir, port_id);
+}
+EXPORT_SYMBOL_GPL(ask_hw_flow_preflight);
+
+int ask_hw_flow_preflight_port(const struct ask_flow_key *key,
+			       u32 oif, u32 action_flags,
+			       enum ask_hw_dir dir, u8 port_id)
+{
 	struct ask_hw_pcd *h = ask_hw_pcd_get();
 	u32 tx_fqid = 0;
-	u8  port_id = 0;
 	int rc;
 
 	(void)dir;
@@ -2378,12 +2398,9 @@ int ask_hw_flow_preflight(const struct ask_flow_key *key,
 		}
 	}
 
-	/* Ingress hwport must resolve first (it owns the classifier AND its
-	 * per-port family mask decides v4/v6 admission). Resolve BEFORE the
-	 * family gate so admission is by TRUE INGRESS PORT, address-independent. */
-	rc = ask_hw_resolve_iif_port(key->iif, &port_id);
-	if (rc)
-		return rc;
+	/* Ingress port is the caller's argument here (the exported wrapper
+	 * above resolves key->iif and delegates; bond callers pass the
+	 * member port directly). */
 
 	/* Never NAT- or VLAN-offload the eth0 management lifeline, even when the
 	 * corresponding global gate is enabled. It remains available for SSH/recovery. */
@@ -2420,19 +2437,39 @@ int ask_hw_flow_preflight(const struct ask_flow_key *key,
 
 	return rc;
 }
-EXPORT_SYMBOL_GPL(ask_hw_flow_preflight);
 
 int ask_hw_flow_insert(const struct ask_flow_key *key,
 		       u32 oif, u32 action_flags,
 		       enum ask_hw_dir dir,
 		       u32 *out_hw_id)
 {
+	u8 port_id;
+	int rc;
+
+	if (!key || !out_hw_id)
+		return -EINVAL;
+
+	/* Ingress hwport owns the CC tree AND its per-port family mask; resolve
+	 * first, then apply the same per-port family/proto gate as preflight. */
+	rc = ask_hw_resolve_iif_port(key->iif, &port_id);
+	if (rc)
+		return rc;
+
+	return ask_hw_flow_insert_port(key, oif, action_flags, dir, port_id,
+				       out_hw_id);
+}
+EXPORT_SYMBOL_GPL(ask_hw_flow_insert);
+
+int ask_hw_flow_insert_port(const struct ask_flow_key *key,
+			    u32 oif, u32 action_flags,
+			    enum ask_hw_dir dir,
+			    u8 port_id, u32 *out_hw_id)
+{
 	struct ask_hw_pcd *h = ask_hw_pcd_get();
 	struct ask_hw_flow_cookie ck;
 	struct ask_hw_port *p;
 	u32 tx_fqid = 0;
 	u32 cookie;
-	u8  port_id = 0;
 	int rc;
 
 	(void)action_flags; (void)dir;
@@ -2444,12 +2481,6 @@ int ask_hw_flow_insert(const struct ask_flow_key *key,
 	/* No HW backing -> SW-only fallback. */
 	if (!h)
 		return -ENODEV;
-
-	/* Ingress hwport owns the CC tree AND its per-port family mask; resolve
-	 * first, then apply the same per-port family/proto gate as preflight. */
-	rc = ask_hw_resolve_iif_port(key->iif, &port_id);
-	if (rc)
-		return rc;
 
 	rc = ask_hw_flow_family_ok(port_id, key);
 	if (rc)
@@ -2503,7 +2534,6 @@ out_unlock:
 	mutex_unlock(&h->lock);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(ask_hw_flow_insert);
 
 int ask_hw_flow_remove(u32 hw_flow_id)
 {
