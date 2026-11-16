@@ -1553,7 +1553,8 @@ int ask_hw_offload_engage(u8 hw_port_id)
 EXPORT_SYMBOL_GPL(ask_hw_offload_engage);
 
 static int ask_hw_resolve_iif_port(u32 ifindex, u8 *port_id);
-static int ask_hw_resolve_oif_fqid(u32 ifindex, u32 *fqid, bool allow_alloc);
+static int ask_hw_resolve_oif_fqid(u32 ifindex, u32 *fqid, bool allow_alloc,
+				   const struct ask_flow_key *key);
 
 static int ask_hw_b2_port_of(const char *ifname, u8 *port_id)
 {
@@ -2028,7 +2029,8 @@ static int ask_hw_resolve_iif_port(u32 ifindex, u8 *port_id)
  * Only ask_hw_prewarm_egress_fq() (genuinely safe process context, no
  * flow_block_lock held) passes allow_alloc=true.
  */
-static int ask_hw_resolve_oif_fqid(u32 ifindex, u32 *fqid, bool allow_alloc)
+static int ask_hw_resolve_oif_fqid(u32 ifindex, u32 *fqid, bool allow_alloc,
+				   const struct ask_flow_key *key)
 {
 	struct ask_hw_pcd *h = ask_hw_pcd_inst;
 	struct net_device *dev;
@@ -2049,6 +2051,28 @@ static int ask_hw_resolve_oif_fqid(u32 ifindex, u32 *fqid, bool allow_alloc)
 	dev = dev_get_by_index(&init_net, ifindex);
 	if (!dev)
 		return -ENODEV;
+
+	/*
+	 * Inc 1 (D1/D2): a bond is not a physical egress; pick the per-flow
+	 * slave deterministically from @key and resolve THAT. The neighbour
+	 * and SMAC baked into the record stay the bond's (correct for the
+	 * bond -- D1); only the TX FQ belongs to the slave. The cache below
+	 * is already keyed by PHYSICAL ifindex, so bond flows and flows
+	 * egressing the slave directly share one no-confirm FQ.
+	 * @key == NULL (prewarm/cache-only) never lowers: a bond master's
+	 * own slot can never be warm, so those callers keep failing closed
+	 * for bonds exactly as before. No eligible slave -> -ENODEV (SW).
+	 */
+	if (key && netif_is_bond_master(dev)) {
+		struct net_device *slave;
+		int sidx = ask_bond_select_egress(key, dev);
+
+		slave = sidx ? dev_get_by_index(&init_net, sidx) : NULL;
+		dev_put(dev);
+		if (!slave)
+			return -ENODEV;
+		dev = slave;
+	}
 
 	/* T-M6-8: egress may be an 802.1Q VLAN vif; the DPAA TX FQ belongs to
 	 * the physical lower device. Resolve + cache by the PHYSICAL ifindex so
@@ -2188,10 +2212,11 @@ bool ask_hw_port_is_l2(u8 hw_port_id)
 	return test_bit(hw_port_id, ask_hw_port_l2);
 }
 
-/* Cache-only egress FQ lookup: safe under rtnl (never allocates). */
+/* Cache-only egress FQ lookup: safe under rtnl (never allocates). No flow
+ * key -> no bond lowering; @ifindex must be a physical (or VLAN) netdev. */
 int ask_hw_oif_fqid_cached(u32 ifindex, u32 *fqid)
 {
-	return ask_hw_resolve_oif_fqid(ifindex, fqid, false);
+	return ask_hw_resolve_oif_fqid(ifindex, fqid, false, NULL);
 }
 
 /* @hw_port_id's slot if it is engaged as L2_DA. h->lock held. */
@@ -2288,8 +2313,9 @@ void ask_hw_prewarm_egress_fq(u8 hw_port_id)
 		ifindex = dev->ifindex;
 	rtnl_unlock();
 
+	/* @dev is always a physical DPAA port here -> no flow key needed. */
 	if (ifindex)
-		ask_hw_resolve_oif_fqid(ifindex, &fqid, true);
+		ask_hw_resolve_oif_fqid(ifindex, &fqid, true, NULL);
 }
 
 int ask_hw_flow_preflight(const struct ask_flow_key *key,
@@ -2381,7 +2407,7 @@ int ask_hw_flow_preflight(const struct ask_flow_key *key,
 	/* Egress forward FQ must exist before we publish. CR-013: this runs
 	 * in the flow-insert hot path under flow_block_lock -- never allow
 	 * the cold-cache allocation here. */
-	rc = ask_hw_resolve_oif_fqid(oif, &tx_fqid, false);
+	rc = ask_hw_resolve_oif_fqid(oif, &tx_fqid, false, key);
 	if (rc)
 		return rc;
 
@@ -2439,7 +2465,7 @@ int ask_hw_flow_insert(const struct ask_flow_key *key,
 
 	/* CR-013: same hot-path constraint as ask_hw_flow_preflight() above --
 	 * this runs under flow_block_lock, never allow the cold-cache alloc. */
-	rc = ask_hw_resolve_oif_fqid(oif, &tx_fqid, false);
+	rc = ask_hw_resolve_oif_fqid(oif, &tx_fqid, false, key);
 	if (rc)
 		return rc;
 

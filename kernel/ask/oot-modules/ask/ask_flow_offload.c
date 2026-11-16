@@ -4041,6 +4041,42 @@ static int ask_pppoe_netdev_event(struct notifier_block *nb,
 		ask_devchg_queue(dev->ifindex);
 		schedule_work(&ask_devchg_flush_work);
 	}
+	/*
+	 * Inc 1 (§D3, conservative flush): bond records are keyed on the BOND
+	 * (oif/key.iif == bondX, D1) while physically riding one slave, so a
+	 * slave event must retire the bond's records -- the slave's own
+	 * ifindex appears nowhere in them. The devchg collector matches
+	 * oif/iif/nh_ifindex, so queueing the bond's ifindex retires them;
+	 * SW re-forward + flowtable re-offload re-picks the slave (D2/D3).
+	 * The bond's own DOWN/UNREGISTER belt-and-braces the kernel
+	 * flowtable's cleanup, same posture as the VLAN vif T1 case above.
+	 * (The bond's own CHANGEMTU/CHANGEADDR already flush via the general
+	 * any-netdev path above.)
+	 */
+	if ((event == NETDEV_DOWN || event == NETDEV_UNREGISTER ||
+	     event == NETDEV_CHANGEMTU || event == NETDEV_CHANGEADDR) &&
+	    ask_flow_default_table()) {
+		struct net_device *bond = NULL;
+
+		if (netif_is_bond_slave(dev))
+			bond = netdev_master_upper_dev_get(dev); /* rtnl held */
+		else if (netif_is_bond_master(dev) &&
+			 (event == NETDEV_DOWN || event == NETDEV_UNREGISTER))
+			bond = dev;
+		if (bond && netif_is_bond_master(bond)) {
+			ask_devchg_queue(bond->ifindex);
+			schedule_work(&ask_devchg_flush_work);
+		}
+	}
+	if (event == NETDEV_CHANGEUPPER && ask_flow_default_table()) {
+		const struct netdev_notifier_changeupper_info *cu = ptr;
+
+		/* Slave unlinked: retire the (former) bond's records. */
+		if (!cu->linking && netif_is_bond_master(cu->upper_dev)) {
+			ask_devchg_queue(cu->upper_dev->ifindex);
+			schedule_work(&ask_devchg_flush_work);
+		}
+	}
 	return NOTIFY_DONE;
 }
 

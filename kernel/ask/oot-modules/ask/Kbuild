@@ -33,6 +33,7 @@ ask_main.o \
 ask_genl.o \
 ask_genl_attr.o \
 ask_hw.o \
+ask_bond.o \
 ask_flow.o \
 ask_flow_offload.o \
 ask_vlan_cc.o \

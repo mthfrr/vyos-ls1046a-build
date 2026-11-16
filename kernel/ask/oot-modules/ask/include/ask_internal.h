@@ -432,6 +432,11 @@ void ask_hw_cookie_free(struct ask_hw_pcd *h, u32 cookie);
  */
 struct ask_flow_key;
 
+/* Bonding (ask_bond.c) - 802.3ad per-flow egress slave selection. */
+u32 ask_bond_hash_index(const struct ask_flow_key *key, unsigned int n);
+int  ask_bond_select_egress(const struct ask_flow_key *key,
+			    struct net_device *bond);
+
 /*
  * T-M6-A4 preflight: validate every resource class the current flow requires
  * WITHOUT allocating a cookie, writing MURAM/DDR, or changing an FQ. Returns
