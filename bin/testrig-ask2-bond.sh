@@ -3,59 +3,62 @@
 # (PLAN.md Inc 5; per-slave ingress records from Inc 2, CLI from vyos-1x patch 061,
 # retirement measurements feeding Inc 3).
 #
-# Wiring assumed (everything env-parameterized; each assumption is asserted in
-# preflight - the script ABORTs with a named reason rather than reporting a false FAIL):
+# Wiring: the LACP partner is a 10G switch.
 #
-#   OUT_HOST <saved-config network> DUT(OUT side) ... DUT(bond0 = DUT_PORTS)
-#       DUT(bond0) <==== 802.3ad, two cables ====> PEER(bond0 = PEER_PORTS) --- LAN --> PEER side
+#   DUT(bond0 = DUT_PORTS) ===two cables==== 10G switch (LACP port-channel)
+#   GEN1(BOND_EP1_IF) --------one cable----> same switch, same VLAN
+#   GEN2(BOND_EP2_IF) --------one cable----> same switch, same VLAN
 #
-#   PEER is a second VyOS box acting as the LACP partner and far traffic endpoint.
-#   Transit flows run PEER <--> OUT_HOST through the DUT, so every offloaded flow
-#   arrives with iif == bond0 on the DUT - the exact Inc 2 ingress-copy case.
+# Transit flows run GEN1 <--> GEN2, FORCED through the DUT by /32 host routes, so
+# every offloaded flow arrives with iif == bond0 and egresses bond0 - the exact
+# Inc 1/2 egress-lowering + ingress-copy case.
 #
-# Nothing is saved on either box: all VyOS changes are runtime commits (exit discard).
-# DUT and PEER are rebooted at the end to restore their saved configs; NOREBOOT=1
-# skips the reboot - then do it yourself before anything else touches the boxes.
+# ONE-TIME SWITCH SETUP (operator; preflight below fails fast if it is wrong):
+#   - port-channel containing the two DUT cables, LACP enabled (active or passive:
+#     the DUT side is always active); member ports enslaved, no per-port blocking
+#   - the channel + both generator ports in ONE flat VLAN carrying 10.98.0.0/24
+#     and fd98::/64; the switch must NOT own a router/SVI for that VLAN
+#   - set the channel's LACP timeout/rate to "fast" if configurable (speeds up P4;
+#     at the 30 s default P4 waits longer but still passes)
+#
+# Nothing is saved on any box: VyOS changes are runtime commits (exit discard);
+# the DUT is rebooted at the end to restore its saved config; generator changes are
+# plain `ip` commands undone by the cleanup. NOREBOOT=1 skips the DUT reboot - then
+# do it yourself before anything else touches the box.
 #
 # Usage: OUTDIR=... bin/testrig-ask2-bond.sh
 # Env (besides testrig.env):
-#   PEER_DUT          VyOS LACP partner SSH target                            (required)
-#   OUT_HOST          iperf3 server host, same L2 as the DUT's saved-config OUT side (required)
-#   DUT_PORTS="eth3 eth4"     DUT bond members (FMan ports; raw-flushed at start)
-#   PEER_PORTS="eth2 eth3"    PEER bond members, cabled DUT_PORTS[0]->PEER_PORTS[0], [1]->[1]
-#   OUT_HOST_IF=eth0        OUT_HOST interface facing the DUT's OUT side
-#   B4=10.98.0.1/24 B6=fd98::1/64   DUT bond0 addresses (PEER auto-picks .2)
+#   DUT_PORTS="eth3 eth4"         DUT bond members (FMan ports; raw-flushed at start)
+#   BOND_EP1_IF=$GEN_IF           GEN1 data NIC cabled to the switch
+#   BOND_EP2_IF=$GEN_IF           GEN2 data NIC cabled to the switch
 #   DUR=10 REPS=1 FAILSECS=25 LEAK_REPS=20
-#   NOREBOOT=1          leave both boxes on the test config
+#   NOREBOOT=1                    leave the DUT on the test config
 # Output: $OUTDIR/bond-*; one tagged line per check in bond-results.txt.
 # REQUIRES an ISO with the feat/lacp kernel (ask.ko Inc 1+2) and vyos-1x patch 061.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/testrig-env.sh"
-rig_require ASK2_DUT PEER_DUT OUT_HOST
+rig_require ASK2_DUT GEN1 GEN2
 DUT_PORTS=${DUT_PORTS:-"eth3 eth4"}
-PEER_PORTS=${PEER_PORTS:-"eth2 eth3"}
-OUT_HOST_IF=${OUT_HOST_IF:-eth0}
-B4=${B4:-10.98.0.1/24}; B6=${B6:-fd98::1/64}
+BOND_EP1_IF=${BOND_EP1_IF:-$GEN_IF}
+BOND_EP2_IF=${BOND_EP2_IF:-$GEN_IF}
 DUR=${DUR:-10}; REPS=${REPS:-1}; FAILSECS=${FAILSECS:-25}; LEAK_REPS=${LEAK_REPS:-20}
 RUN=${OUTDIR:?set OUTDIR to the run directory}; mkdir -p "$RUN"
+# addressing: DUT router .1; EP1 .112; EP2 .113 (matches the rig's x.112/.113 habit)
+D4=10.98.0.1; E14=10.98.0.112; E24=10.98.0.113
+D6=fd98::1;   E16=fd98::112;   E26=fd98::113
 SSHO=(-n -o BatchMode=yes -o ConnectTimeout=8 $RIG_SSHK)
 d(){ ssh "${SSHO[@]}" "$ASK2_DUT" "$@"; }
 di(){ ssh "${SSHO[@]}" "$ASK2_DUT" "$@"; }
-p(){ ssh "${SSHO[@]}" "$PEER_DUT" "$@"; }
-o(){ ssh "${SSHO[@]}" "$OUT_HOST" "$@"; }
+e1(){ ssh "${SSHO[@]}" "$GEN1" "$@"; }
+e2(){ ssh "${SSHO[@]}" "$GEN2" "$@"; }
 # one VyOS configure session, runtime commit, never saved (testrig-ask2-wan.sh pattern)
-vy_raw(){ local tgt=$1; shift
-  { echo 'source /opt/vyatta/etc/functions/script-template'; echo configure; printf '%s\n' "$@"; echo commit; echo 'exit discard'; } |
-    "$tgt" 'vbash -s' 2>&1 | grep -vE '^(\[edit\]|$)|discardChanges|Warning: configuration changes have not been saved' || true; }
-vy_d(){ vy_raw di "$@"; }
-vy_p(){ vy_raw p "$@"; }
+vy_d(){ { echo 'source /opt/vyatta/etc/functions/script-template'; echo configure;
+          printf '%s\n' "$@"; echo commit; echo 'exit discard'; } |
+        di 'vbash -s' 2>&1 | grep -vE '^(\[edit\]|$)|discardChanges|Warning: configuration changes have not been saved' || true; }
 # returns 0 when the session commits clean, 1 when the CLI reported an Error
 vy_d_ok(){ vy_d "$@" | grep -qi 'Error:' && return 1 || return 0; }
 MEM1=$(echo $DUT_PORTS | cut -d' ' -f1); MEM2=$(echo $DUT_PORTS | cut -d' ' -f2)
-BOND_IP=${B4%/*}; PEER_BOND_IP=${B4%.*}.2
-B6_IP=${B6%/*}; PEER_B6=$(echo "$B6" | sed 's/:1\/64/:2\/64/'); PEER_B6_IP=${PEER_B6%/*}
-B4_NET=${B4%.*}.0/24
 PASS=0; FAIL=0
 res(){ local r=$1 ph=$2; shift 2
        printf '[%s] %s: %s\n' "$r" "$ph" "$*" | tee -a "$RUN/bond-results.txt"
@@ -65,11 +68,23 @@ flows(){ d "sudo /usr/local/bin/ynl --family ask --dump dump-flows --output-json
          python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo ERR; }
 cpu(){ d "grep '^cpu ' /proc/stat"; }
 busy(){ printf '%s\n%s\n' "$1" "$2" | awk '{for(i=2;i<=11;i++)a[NR,i]=$i} END{for(i=2;i<=11;i++){x=a[2,i]-a[1,i];T+=x;if(i==5||i==6)id+=x}; printf "%.1f",100*(T-id)/T}'; }
+max_gap(){ python3 - "$1" <<'PY'
+import re, sys
+txt = open(sys.argv[1]).read() if open(sys.argv[1]).read() else ''
+seqs = [int(m) for m in re.findall(r'icmp_seq=(\d+)', txt)]
+g = max((b - a for a, b in zip(seqs, seqs[1:]) if b - a > 1), default=0)
+print('%.1f' % (g / float(sys.argv[2])))
+PY
+}
 
 cleanup(){
-  [ "${NOREBOOT:-0}" = 1 ] && { echo "NOREBOOT: both boxes stay on the test config - reboot before reuse"; return; }
-  echo "rebooting DUT and PEER to restore saved configs"
-  p "sudo systemctl reboot" 2>/dev/null; d "sudo systemctl reboot" 2>/dev/null
+  e1 "sudo ip addr del $E14/24 dev $BOND_EP1_IF 2>/dev/null; sudo ip -6 addr del $E16/64 dev $BOND_EP1_IF 2>/dev/null
+      sudo ip route del $E24/32 2>/dev/null; sudo ip -6 route del $E26/128 2>/dev/null; pkill -f 'iperf3' 2>/dev/null" >/dev/null 2>&1
+  e2 "sudo ip addr del $E24/24 dev $BOND_EP2_IF 2>/dev/null; sudo ip -6 addr del $E26/64 dev $BOND_EP2_IF 2>/dev/null
+      sudo ip route del $E14/32 2>/dev/null; sudo ip -6 route del $E16/128 2>/dev/null; pkill -f 'iperf3' 2>/dev/null" >/dev/null 2>&1
+  [ "${NOREBOOT:-0}" = 1 ] && { echo "NOREBOOT: DUT stays on the test config - reboot before reuse"; return; }
+  echo "rebooting the DUT to restore its saved config"
+  d "sudo systemctl reboot" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -90,50 +105,29 @@ vy_d_ok "set interfaces bonding bond9 mtu 9500" \
   || res PASS P0 'MTU outside [1280,9000] + offload rejected'
 d "vbash -c 'configure; delete interfaces bonding bond9; commit; exit discard'" >/dev/null 2>&1
 
-##### preflight — wiring and tooling
-OUT_IP=$(d "ip route show default | awk '{print \$5; exit}'")
-[ -n "$OUT_IP" ] || abort preflight 'DUT has no default route in its running config - the OUT-side assumption fails'
-o "ping -c2 -W2 $OUT_IP" >/dev/null 2>&1 || abort preflight "OUT_HOST cannot reach the DUT OUT address $OUT_IP (check OUT_HOST/$OUT_HOST_IF)"
-o "which iperf3" >/dev/null || abort preflight 'iperf3 missing on OUT_HOST'
-p "which iperf3" >/dev/null || abort preflight 'iperf3 missing on PEER'
-OUT_HOST_H=${OUT_HOST#*@}
-OUT_HOST_IP=$(python3 -c "import socket;print(socket.gethostbyname('$OUT_HOST_H'))")
-o "ip -4 addr show dev $OUT_HOST_IF" 2>/dev/null | grep -q "$OUT_HOST_IP" \
-  || abort preflight "OUT_HOST ($OUT_HOST_H -> $OUT_HOST_IP) is not an address on $OUT_HOST_IF - point OUT_HOST at its data-side address facing the DUT OUT network"
-# v6 transit endpoint is optional; without it P3 v6 SKIPs (a v6 iperf to the
-# DUT's own bond address would terminate locally and can never be offloaded)
-OUT6_ADDR=$(o "ip -6 addr show dev $OUT_HOST_IF scope global | awk '/inet6/{print \$2; exit}'")
-if [ -z "$OUT6_ADDR" ] || ! d "ip -6 route show default | grep -q ." ; then
-  OUT6_ADDR=""
-  V6RT=""
-else
-  # PEER reaches the OUT network's v6 space through the DUT via the bond
-  OUT6_NET=$(python3 -c "import ipaddress;print(ipaddress.IPv6Interface('$OUT6_ADDR').network)")
-  V6RT="set protocols static interface-route $OUT6_NET next-hop-0 $B6_IP"
-fi
+##### preflight — generator basics, then free the DUT members
+e1 "which iperf3" >/dev/null || abort preflight 'iperf3 missing on GEN1'
+e2 "which iperf3" >/dev/null || abort preflight 'iperf3 missing on GEN2'
 for i in $DUT_PORTS; do d "sudo ip addr flush dev $i; sudo ip link set $i nomaster 2>/dev/null; true"; done
 
-##### P1 — bond bring-up both sides, LACP active
+##### P1 — bond bring-up (DUT side) + forced-transit routing on the generators
 vy_d "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 lacp-rate fast" \
      "set interfaces bonding bond0 offload ipv4" "set interfaces bonding bond0 offload ipv6" \
      $(for i in $DUT_PORTS; do echo "set interfaces bonding bond0 member interface $i"; done) \
-     "set interfaces bonding bond0 address $B4" "set interfaces bonding bond0 address $B6"
-vy_p "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 lacp-rate fast" \
-     $(for i in $PEER_PORTS; do echo "set interfaces bonding bond0 member interface $i"; done) \
-     "set interfaces bonding bond0 address ${PEER_BOND_IP}/24" "set interfaces bonding bond0 address ${PEER_B6}/64" \
-     "set protocols static route ${OUT_HOST_IP}/32 next-hop $BOND_IP" ${V6RT:+$V6RT}
+     "set interfaces bonding bond0 address $D4/24" "set interfaces bonding bond0 address $D6/64"
+e1 "sudo ip addr replace $E14/24 dev $BOND_EP1_IF; sudo ip -6 addr replace $E16/64 dev $BOND_EP1_IF nodad
+    sudo ip route replace $E24/32 via $D4 dev $BOND_EP1_IF; sudo ip -6 route replace $E26/128 via $D6 dev $BOND_EP1_IF"
+e2 "sudo ip addr replace $E24/24 dev $BOND_EP2_IF; sudo ip -6 addr replace $E26/64 dev $BOND_EP2_IF nodad
+    sudo ip route replace $E14/32 via $D4 dev $BOND_EP2_IF; sudo ip -6 route replace $E16/128 via $D6 dev $BOND_EP2_IF"
 sleep 15
 d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-proc.txt"
-p "cat /proc/net/bonding/bond0" > "$RUN/bond-peer-proc.txt"
-if d "ping -c2 -W2 $PEER_BOND_IP >/dev/null" && p "ping -c2 -W2 $BOND_IP >/dev/null"; then
-  [ "$(grep -c 'MII Status: up' "$RUN/bond-dut-proc.txt")" -ge 3 ] \
-    && res PASS P1 'LACP active, bond reachable both directions' \
-    || res FAIL P1 'ping OK but bond MII not fully up (see bond-dut-proc.txt)'
+if [ "$(grep -c 'MII Status: up' "$RUN/bond-dut-proc.txt")" -ge 3 ] && e1 "ping -c2 -W2 $E24 >/dev/null"; then
+  res PASS P1 'LACP aggregated with the switch, transit GEN1->GEN2 via the DUT works'
 else
-  abort P1 'bond0 not reachable - check DUT_PORTS<->PEER_PORTS cabling order (swapping PEER_PORTS is the usual fix)'
+  abort P1 'no LACP aggregation or no transit - recheck the switch checklist (port-channel LACP on, ONE flat VLAN for all three ports, no switch SVI on 10.98.0.0/24)'
 fi
-p "ping -c2 -W2 $OUT_HOST_IP >/dev/null" || abort preflight 'PEER cannot reach OUT_HOST via the new route (check the OUT subnet assumption)'
-o "sudo ip route replace $B4_NET via $OUT_IP dev $OUT_HOST_IF"
+d "ping -c2 -W2 $E14 >/dev/null" && d "ping -6 -c2 -W2 $E26 >/dev/null" \
+  && res PASS P1 'DUT reaches both generators (v4 + v6)' || res FAIL P1 'DUT cannot reach a generator (check addresses/VLAN)'
 
 ##### P2 — patch 061 rendering: auto flowtable on bond0, hw-tc-offload on members
 d "nft list table ip vyos_filter"  > "$RUN/bond-nft-v4.txt"
@@ -148,22 +142,21 @@ for i in $DUT_PORTS; do
 done
 
 ##### P3 — steady-state offload: flows present, DUT CPUs idle
-o "pkill -f 'iperf3 -s' 2>/dev/null; iperf3 -s -D -p 5281" >/dev/null 2>&1
-iperf_run(){ # iperf_run <4|6> -> Gbit/s on stdout
-  local src=$PEER_BOND_IP dst=$OUT_HOST_IP
-  [ "$1" = 6 ] && { src=$PEER_B6_IP; dst=${OUT6_ADDR%/*}; }
-  p "timeout $((DUR + 30)) iperf3 -c $dst -B $src -p 5281 -P 4 -t $DUR -Z -J" > "$RUN/bond-iperf-v$1.json"
+e2 "pkill -f 'iperf3 -s' 2>/dev/null; iperf3 -s -D -p 5281" >/dev/null 2>&1
+iperf_run(){ # iperf_run <4|6> -> Gbit/s on stdout; GEN1 -> GEN2 through the DUT
+  local src=$E14 dst=$E24
+  [ "$1" = 6 ] && { src=$E16; dst=$E26; }
+  e1 "timeout $((DUR + 30)) iperf3 -c $dst -B $src -p 5281 -P 4 -t $DUR -Z -J --bidir" > "$RUN/bond-iperf-v$1.json"
   python3 - "$RUN/bond-iperf-v$1.json" <<'PY'
 import json, sys
-try: j = json.load(open(sys.argv[1])); print('%.2f' % (j['end']['sum_received']['bits_per_second'] / 1e9))
-except Exception: print(0)
+try:
+    j = json.load(open(sys.argv[1]))
+    print('%.2f' % (j['end']['sum_received']['bits_per_second'] / 1e9))
+except Exception:
+    print(0)
 PY
 }
 for rep in $(seq 1 "$REPS"); do for fam in 4 6; do
-  if [ "$fam" = 6 ] && [ -z "$OUT6_ADDR" ]; then
-    [ "$rep" = 1 ] && res SKIP P3 'no global v6 on the OUT side (OUT_HOST data NIC or DUT default v6 missing) - v6 transit not measurable here'
-    continue
-  fi
   c0=$(cpu); gb=$(iperf_run "$fam" | tail -1); c1=$(cpu); b=$(busy "$c0" "$c1")
   sleep 2
   flows > "$RUN/bond-flowcount-v$fam-r$rep.txt"
@@ -175,52 +168,57 @@ for rep in $(seq 1 "$REPS"); do for fam in 4 6; do
     || res FAIL P3 "v$fam not visibly offloaded (flows=$nf busy=${b}% gbps=$gb)"; }
 done; done
 
-##### P4 — LACPDU punt under engaged offload (lacp-rate fast => ~1s between PDUs)
-d "sudo timeout 10 tcpdump -qi bond0 -c2 'ether proto 0x8809' -nn" > "$RUN/bond-lacpdu.txt" 2>&1 \
+##### P4 — LACPDU punt under engaged offload (timeout covers the switch's 30 s slow rate)
+d "sudo timeout 40 tcpdump -qi bond0 -c1 'ether proto 0x8809' -nn" > "$RUN/bond-lacpdu.txt" 2>&1 \
   && res PASS P4 'LACPDUs visible on bond0 while offload engaged' \
   || res FAIL P4 'no LACPDUs on bond0 - punt regression (bond-lacpdu.txt)'
 
 ##### P5 — failover under load: pull one member, measure the transit gap (Inc 3 input)
-p "iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t $((2 * FAILSECS)) -i 1 > /tmp/bond-fail-iperf.json 2>&1 &
-   ping -i 0.1 -c $((10 * (2 * FAILSECS))) $OUT_HOST_IP > /tmp/bond-fail-ping.txt 2>&1 &"
+e1 "ping -i 0.1 -c $((10 * (2 * FAILSECS))) $E24 > /tmp/bond-fail-ping.txt 2>&1 &
+    iperf3 -c $E24 -B $E14 -p 5281 -t $((2 * FAILSECS)) -i 1 --bidir > /tmp/bond-fail-iperf.json 2>&1 &"
 sleep 5
 d "sudo ip link set $MEM1 down"
 sleep $((FAILSECS - 5))
 d "sudo ip link set $MEM1 up"
 sleep $((FAILSECS + 10))
-p "cat /tmp/bond-fail-ping.txt"  > "$RUN/bond-failover-ping.txt" 2>/dev/null
-p "cat /tmp/bond-fail-iperf.json" > "$RUN/bond-failover-iperf.json" 2>/dev/null
-p "pkill -f 'iperf3 -c' 2>/dev/null" 2>/dev/null
+e1 "cat /tmp/bond-fail-ping.txt"  > "$RUN/bond-failover-ping.txt" 2>/dev/null
+e1 "cat /tmp/bond-fail-iperf.json" > "$RUN/bond-failover-iperf.json" 2>/dev/null
+e1 "pkill -f 'iperf3 -c' 2>/dev/null; pkill -f 'ping -i 0.1' 2>/dev/null" 2>/dev/null
 d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-after-failover.txt"
-python3 - "$RUN/bond-failover-ping.txt" "$RUN/bond-failover-gap.txt" <<'PY'
-import re, sys
-seqs = [int(m) for m in re.findall(r'icmp_seq=(\d+)', open(sys.argv[1]).read())] if open(sys.argv[1]).read() else []
-g = max((b - a for a, b in zip(seqs, seqs[1:]) if b - a > 1), default=0)
-gap = g / 10.0
-open(sys.argv[2], 'w').write('%.1f\n' % gap)
-print('%.1f' % gap)
-PY
-res MEASURE P5 "pull-one-member transit gap $(cat "$RUN/bond-failover-gap.txt" 2>/dev/null || echo '?')s (iperf intervals show retransmit collapse; feed into the Inc 3 matrix)"
+res MEASURE P5 "pull-one-member transit gap $(max_gap "$RUN/bond-failover-ping.txt" 10)s (NETDEV_DOWN path: D3 flush must re-program; iperf json shows the retransmit collapse)"
 
 ##### P6 — partner-timeout-with-carrier (the quiet case; measured, verdict is Inc 3's)
-PEER_MEM=$(awk '/Slave Interface/{print $3; exit}' "$RUN/bond-peer-proc.txt")
-# drop ONLY LACPDUs (ethertype at -2 = last 2 bytes before the L3 header)
-p "sudo tc qdisc add dev $PEER_MEM ingress 2>/dev/null
-   sudo tc filter add dev $PEER_MEM parent ffff: protocol all prio 1 u32 match u16 0x8809 0xffff at -2 action drop" >/dev/null 2>&1
-sleep 1
-if d "timeout 6 tcpdump -qi $MEM1 -c1 'ether proto 0x8809'" >/dev/null 2>&1; then
+# Stop RECEIVING LACPDUs by dropping them at the DUT member's ingress qdisc - carrier
+# stays up, no netdev event, and the DUT's bonding state machine must notice. This
+# needs no switch access and IS the state under test (the mux expiry the D3 flush
+# never sees). The pings run BEFORE the filter goes in: at lacp-rate fast the partner
+# timeout is only ~3 s and must not elapse while we are still verifying.
+e1 "ping -i 0.2 -c 175 $E24 > /tmp/bond-quiet-ping.txt 2>&1 &
+    iperf3 -c $E24 -B $E14 -p 5281 -t 40 -i 1 --bidir > /tmp/bond-quiet-iperf.json 2>&1 &"
+sleep 12   # let the iperf flows age past the offload delay so they ARE on silicon
+d "sudo tc qdisc add dev $MEM1 ingress 2>/dev/null
+   sudo tc filter add dev $MEM1 parent ffff: protocol all prio 1 u32 match u16 0x8809 0xffff at -2 action drop" >/dev/null 2>&1
+sleep 3
+# self-validation: tcpdump on the member (its tap sees ingress before the qdisc
+# verdict) - if PDUs still arrive, the filter is broken; SKIP honestly
+if d "sudo timeout 5 tcpdump -qi $MEM1 -c1 'ether proto 0x8809'" >/dev/null 2>&1; then
   res SKIP P6 'tc filter did not stop LACPDUs (syntax varies by iproute2) - repeat the drop your way, then measure'
 else
-  p "ping -i 0.2 -c 150 $OUT_HOST_IP > /tmp/bond-quiet-ping.txt 2>&1" || true
-  p "cat /tmp/bond-quiet-ping.txt" > "$RUN/bond-quiet-transition-ping.txt" 2>/dev/null
+  sleep 30
   d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-quiet.txt"
-  res MEASURE P6 'LACPDUs stopped, carrier kept: blackhole window from bond-quiet-transition-ping.txt (Inc 3 §4 - was traffic silently HW-pinned to the stale slave?)'
+  e1 "pkill -f 'ping -i 0.2' 2>/dev/null; pkill -f 'iperf3 -c' 2>/dev/null
+      cat /tmp/bond-quiet-ping.txt" > "$RUN/bond-quiet-transition-ping.txt" 2>/dev/null
+  e1 "cat /tmp/bond-quiet-iperf.json" > "$RUN/bond-quiet-transition-iperf.json" 2>/dev/null
+  expired=$(awk "/Slave Interface: $MEM1/,/^$/" "$RUN/bond-dut-quiet.txt" | grep -c 'Aggregator ID: 0\|MII Status: down')
+  [ "${expired:-0}" -eq 0 ] && res MEASURE P6 'member NOT expired by the mux state machine after ~35 s without PDUs - itself a finding (check bond-dut-quiet.txt mux state)' \
+    || res MEASURE P6 "member expired with carrier kept; transit gap during expiry $(max_gap "$RUN/bond-quiet-transition-ping.txt" 5)s (Inc 3 §4: was traffic silently HW-pinned to the stale slave?)"
 fi
-p "sudo tc qdisc del dev $PEER_MEM ingress 2>/dev/null"
+e1 "pkill -f 'ping -i 0.2' 2>/dev/null" 2>/dev/null
+d "sudo tc qdisc del dev $MEM1 ingress 2>/dev/null"
 sleep 30
 
 ##### P7 — member re-add cycles under churn, record-leak watch
-p "iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t $((8 * LEAK_REPS)) -P 4 -i 5 > /dev/null 2>&1 &"
+e1 "iperf3 -c $E24 -B $E14 -p 5281 -t $((8 * LEAK_REPS)) -P 4 --bidir -i 5 > /dev/null 2>&1 &"
 sleep 3
 base=$(flows)
 for i in $(seq 1 "$LEAK_REPS"); do
@@ -228,18 +226,18 @@ for i in $(seq 1 "$LEAK_REPS"); do
   vy_d "set interfaces bonding bond0 member interface $MEM2"   >/dev/null; sleep 2
 done
 sleep 15; after=$(flows)
-p "pkill -f 'iperf3 -c' 2>/dev/null" 2>/dev/null
+e1 "pkill -f 'iperf3 -c' 2>/dev/null" 2>/dev/null
 d "sudo /usr/local/bin/ynl --family ask --dump dump-flows --output-json" > "$RUN/bond-flows-after-churn.json" 2>/dev/null
 res MEASURE P7 "flow table: baseline=$base after $LEAK_REPS member cycles=$after (compare again after settle; persistent growth = record leak)"
 
 ##### P8 — budget clamp (D5: overflow must stay in software, never wedge)
 before=$(d "cat /sys/module/ask/parameters/max_flows")
 d "sudo sh -c 'echo 4 > /sys/module/ask/parameters/max_flows'"
-p "for n in 1 2 3 4 5 6 7 8; do (iperf3 -c $OUT_HOST_IP -B $PEER_BOND_IP -p 5281 -t 6 -P 1 -w 256k >/dev/null 2>&1 &); sleep 1; done"
+e1 "for n in 1 2 3 4 5 6 7 8; do (iperf3 -c $E24 -B $E14 -p 5281 -t 6 -P 1 -w 256k >/dev/null 2>&1 &); sleep 1; done"
 sleep 8
 n_clamped=$(flows)
 d "sudo sh -c 'echo $before > /sys/module/ask/parameters/max_flows'"
-ping_ok=$(d "ping -c2 -W2 $PEER_BOND_IP >/dev/null" && echo yes || echo no)
+ping_ok=$(e1 "ping -c2 -W2 $E24 >/dev/null" && echo yes || echo no)
 [ "$n_clamped" != ERR ] && [ "$n_clamped" -le 12 ] && [ "$ping_ok" = yes ] \
   && res PASS P8 "budget clamp held (dumped=$n_clamped vs cap 4, ping fine) - no wedge" \
   || res FAIL P8 "budget clamp anomaly (dumped=$n_clamped ping=$ping_ok)"
