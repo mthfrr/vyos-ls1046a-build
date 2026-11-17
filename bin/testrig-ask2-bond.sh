@@ -33,6 +33,10 @@
 #   BOND_EP2_IF=$GEN_IF           GEN2 data NIC cabled to the switch
 #   DUR=10 REPS=1 FAILSECS=25 LEAK_REPS=20
 #   NOREBOOT=1                    leave the DUT on the test config
+#   CARRIER_OFF_CMD/CARRIER_ON_CMD  local commands that take $MEM1's LINK (carrier)
+#                                 away / back WITHOUT admin-down on the DUT - e.g.
+#                                 shut/no-shut the switch-side channel member. Set
+#                                 BOTH to run P5b; unset skips it.
 # Output: $OUTDIR/bond-*; one tagged line per check in bond-results.txt.
 # REQUIRES an ISO with the feat/lacp kernel (ask.ko Inc 1+2) and vyos-1x patch 061.
 set -u
@@ -186,6 +190,35 @@ e1 "cat /tmp/bond-fail-iperf.json" > "$RUN/bond-failover-iperf.json" 2>/dev/null
 e1 "pkill -f 'iperf3 -c' 2>/dev/null; pkill -f 'ping -i 0.1' 2>/dev/null" 2>/dev/null
 d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-after-failover.txt"
 res MEASURE P5 "pull-one-member transit gap $(max_gap "$RUN/bond-failover-ping.txt" 10)s (NETDEV_DOWN path: D3 flush must re-program; iperf json shows the retransmit collapse)"
+
+##### P5b — carrier-only member loss (the NETDEV_CHANGE path; P5's admin-down does NOT cover it)
+# Cable-pull / switch-side-port-shut leaves the DUT member administratively UP and
+# emits only NETDEV_CHANGE - bonding never dev_close()s a slave over carrier loss.
+# Needs link control outside the DUT, so it is opt-in; without it the carrier-loss
+# flush arm goes untested (P6's tc-drop covers the quiet no-event case, not this).
+if [ -n "${CARRIER_OFF_CMD:-}" ] && [ -n "${CARRIER_ON_CMD:-}" ]; then
+  e1 "ping -i 0.1 -c $((10 * (2 * FAILSECS))) $E24 > /tmp/bond-carrier-ping.txt 2>&1 &
+      iperf3 -c $E24 -B $E14 -p 5281 -t $((2 * FAILSECS)) -i 1 --bidir > /tmp/bond-carrier-iperf.json 2>&1 &"
+  sleep 5
+  eval "$CARRIER_OFF_CMD"
+  sleep $((FAILSECS - 5))
+  d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-during-carrier.txt"
+  eval "$CARRIER_ON_CMD"
+  sleep $((FAILSECS + 10))
+  e1 "cat /tmp/bond-carrier-ping.txt"  > "$RUN/bond-carrier-ping.txt" 2>/dev/null
+  e1 "cat /tmp/bond-carrier-iperf.json" > "$RUN/bond-carrier-iperf.json" 2>/dev/null
+  e1 "pkill -f 'iperf3 -c' 2>/dev/null; pkill -f 'ping -i 0.1' 2>/dev/null" 2>/dev/null
+  if grep -q icmp_seq "$RUN/bond-carrier-ping.txt" 2>/dev/null; then
+    gap5b=$(max_gap "$RUN/bond-carrier-ping.txt" 10)
+    awk "BEGIN{exit !($gap5b < 5)}" \
+      && res PASS P5b "carrier-only loss transit gap ${gap5b}s (NETDEV_CHANGE flush works - seconds, not flowtable-timeout minutes)" \
+      || res FAIL P5b "carrier-only loss transit gap ${gap5b}s - HW pinned to the dead member too long (NETDEV_CHANGE flush broken? see bond-dut-during-carrier.txt)"
+  else
+    res FAIL P5b 'no ping samples captured - test inconclusive'
+  fi
+else
+  res SKIP P5b 'CARRIER_OFF_CMD/CARRIER_ON_CMD unset - carrier-only member loss (NETDEV_CHANGE flush) untested; P5 proves only the admin-down path'
+fi
 
 ##### P6 — partner-timeout-with-carrier (the quiet case; measured, verdict is Inc 3's)
 # Stop RECEIVING LACPDUs by dropping them at the DUT member's ingress qdisc - carrier
