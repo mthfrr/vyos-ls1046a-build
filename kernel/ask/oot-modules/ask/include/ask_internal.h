@@ -912,8 +912,10 @@ struct ask_flow_key key;
  * identical to the legacy single hw_flow_id. A bond ingress carries
  * one record per engaged member port (D4), each in that port's own
  * per-port ehash table (F-220). A hw_backed==false entry carries the
- * legacy SW-fallback counter in hw[0].hw_id with port_id 0; its
- * n_hw is still 1 so dumps keep showing an id exactly as before.
+ * legacy SW-fallback counter in hw[0].hw_id; its port_id is the ingress
+ * pid the record would have used (0 on the bond fan-out path) and is
+ * never consumed while hw_backed==false. n_hw is still 1 there, so
+ * dumps keep showing an id exactly as before.
  * Insert-once, immutable; safe to read under rcu_read_lock()
  * alongside hw_backed (same lifetime rules as the old hw_flow_id).
  */

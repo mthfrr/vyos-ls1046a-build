@@ -296,7 +296,9 @@ static void ask_flow_free_walker(void *ptr, void *arg)
 struct ask_flow *f = ptr;
 struct ask_flow_table *t = arg;
 
-atomic_dec(&t->num_flows);
+/* Q1 (PLAN.md, resolved per-copy): num_flows is charged per published
+ * FE copy (see insert); undo the full charge, not one per entry. */
+atomic_sub(f->n_hw, &t->num_flows);
 if (f->hw_backed)
 atomic_dec(&t->num_hw_backed);
 /*
@@ -422,8 +424,11 @@ return -EINVAL;
 /*
  * Inc 2 (D4/Q1): a bond ingress fans out to one FE record per engaged
  * member port; those copies are real records and count against the
- * admission budget. For every other ingress need == 1, making the gate
- * below numerically identical to the legacy `>= ask_max_flows`.
+ * admission budget CUMULATIVELY: a published entry charges f->n_hw
+ * (see atomic_add after the rht insert) and removals subtract the same,
+ * so ask_max_flows bounds FE records, not just table entries. For every
+ * other ingress need == 1 and n_hw == 1, making gate and accounting
+ * numerically identical to the legacy `>= ask_max_flows`.
  */
 need = ask_bond_ingress_copies(key, ingress_ports,
 			       ASK_FLOW_MAX_INGRESS_COPIES);
@@ -643,9 +648,11 @@ ask_pr_warn("flow: hw_insert(cookie=0x%llx) hard fail %d\n",
 kfree(f);
 return rc;
 }
-if (!f->n_hw) {	/* single copy (real id or SW-fallback fake id) */
+if (!f->n_hw) {	/* single copy (real id or SW-fallback fake id);
+			 * port_id is the ingress pid (0 on the all-copies-
+			 * failed bond path), unused unless hw_backed. */
 	f->hw[0].hw_id   = hw_id;
-	f->hw[0].port_id = key->port_id;	/* 0 on legacy/SW paths */
+	f->hw[0].port_id = key->port_id;
 	f->n_hw          = 1;
 }
 f->hw_backed  = hw_inserted;
@@ -715,7 +722,11 @@ ask_pr_warn("flow: insert(cookie=0x%llx) rht err %d\n",
 return rc;
 }
 
-atomic_inc(&t->num_flows);
+/* Q1 (PLAN.md, resolved per-copy): charge the admission budget per
+ * published FE copy — a bond ingress with N copies really creates N
+ * hardware records. Legacy and SW-fallback entries have n_hw==1, so
+ * non-bond accounting is unchanged. */
+atomic_add(f->n_hw, &t->num_flows);
 if (hw_inserted)
 atomic_inc(&t->num_hw_backed);
 /*
@@ -874,7 +885,7 @@ unsigned int ci;
 	atomic_dec(&t->num_hw_backed);
 }
 
-atomic_dec(&t->num_flows);
+atomic_sub(n_hw, &t->num_flows);	/* Q1: undo the per-copy charge */
 if (f->fe_token)	/* F-315: before the grace period starts */
 xa_cmpxchg(&t->by_token, f->fe_token, f, NULL, 0);
 call_rcu(&f->rcu, ask_flow_free_rcu);
