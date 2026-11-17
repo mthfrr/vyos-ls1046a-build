@@ -4120,19 +4120,40 @@ static int ask_pppoe_netdev_event(struct notifier_block *nb,
 	 * flowtable's cleanup, same posture as the VLAN vif T1 case above.
 	 * (The bond's own CHANGEMTU/CHANGEADDR already flush via the general
 	 * any-netdev path above.)
+	 *
+	 * NETDEV_CHANGE completes the set: the realistic member failure --
+	 * cable pulled, link partner port shut -- leaves the slave
+	 * administratively UP and emits ONLY NETDEV_CHANGE (carrier loss);
+	 * bonding never dev_close()s a slave over it. Without this arm the
+	 * HW keeps pushing out the dead slave's TX FQ until the flowtable
+	 * times the flow out, bypassing bonding's millisecond failover.
+	 * Any slave/bond state change can move the eligible set the
+	 * egress/ingress records were picked against, so flush on each
+	 * (D3: when in doubt, retire). Carrier-only-loss coverage is
+	 * measured by rig P5b (bin/testrig-ask2-bond.sh).
 	 */
 	if ((event == NETDEV_DOWN || event == NETDEV_UNREGISTER ||
-	     event == NETDEV_CHANGEMTU || event == NETDEV_CHANGEADDR) &&
+	     event == NETDEV_CHANGEMTU || event == NETDEV_CHANGEADDR ||
+	     event == NETDEV_CHANGE) &&
 	    ask_flow_default_table()) {
-		struct net_device *bond = NULL;
+		int bond_ifindex = 0;
 
-		if (netif_is_bond_slave(dev))
-			bond = netdev_master_upper_dev_get(dev); /* rtnl held */
-		else if (netif_is_bond_master(dev) &&
-			 (event == NETDEV_DOWN || event == NETDEV_UNREGISTER))
-			bond = dev;
-		if (bond && netif_is_bond_master(bond)) {
-			ask_devchg_queue(bond->ifindex);
+		if (netif_is_bond_slave(dev)) {
+			struct net_device *bond;
+
+			/* NETDEV_CHANGE is not guaranteed under rtnl
+			 * (carrier events reach the notifier from driver
+			 * work), so resolve the master under RCU. */
+			rcu_read_lock();
+			bond = netdev_master_upper_dev_get_rcu(dev);
+			if (bond && netif_is_bond_master(bond))
+				bond_ifindex = bond->ifindex;
+			rcu_read_unlock();
+		} else if (netif_is_bond_master(dev) &&
+			 (event != NETDEV_CHANGE || !netif_carrier_ok(dev)))
+			bond_ifindex = dev->ifindex;
+		if (bond_ifindex) {
+			ask_devchg_queue(bond_ifindex);
 			schedule_work(&ask_devchg_flush_work);
 		}
 	}
