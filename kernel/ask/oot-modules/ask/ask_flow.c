@@ -719,11 +719,20 @@ if (rc) {
  * here would tear down an unrelated flow's silicon state.
  */
 if (hw_inserted) {
-int rm_rc = ask_hw_flow_remove(hw_id);
+unsigned int ci;
 
-if (rm_rc)
-ask_pr_warn("flow: hw_remove rollback (cookie=0x%llx hw_id=0x%08x) failed %d\n",
-    cookie, hw_id, rm_rc);
+	/* Inc 2: the bond fan-out may have published several copies
+	 * before the rht insert failed — every one is ours to undo
+	 * (hw[0] is what @hw_id carries; loop the full set).
+	 */
+	for (ci = 0; ci < f->n_hw; ci++) {
+		int rm_rc = ask_hw_flow_remove(f->hw[ci].hw_id);
+
+		if (rm_rc)
+			ask_pr_warn("flow: hw_remove rollback (cookie=0x%llx copy=%u/%u hw_id=0x%08x) failed %d\n",
+				    cookie, ci, f->n_hw, f->hw[ci].hw_id,
+				    rm_rc);
+	}
 }
 kfree(f);
 if (rc == -EEXIST)
