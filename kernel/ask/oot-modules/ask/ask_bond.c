@@ -75,16 +75,25 @@ static int ask_bond_eligible_lower(struct net_device *lower,
 				   struct netdev_nested_priv *priv)
 {
 	struct ask_bond_slaves *s = priv->data;
+	u8 pid;
 
 	/*
 	 * Eligible = enslaved to this bond (the walk is over this master's
-	 * lowers, so master linkage is given) AND admin-up AND carrier on.
-	 * The LACP mux state (AD_STATE_COLLECT) is not exported in-kernel;
-	 * carrier is the available proxy -- Inc 3 measures whether the
-	 * quiet mux-transition gap is real enough to need more.
+	 * lowers, so master linkage is given) AND admin-up AND carrier on
+	 * AND dpaa-backed. The LACP mux state (AD_STATE_COLLECT) is not
+	 * exported in-kernel; carrier is the available proxy -- Inc 3
+	 * measures whether the quiet mux-transition gap is real enough to
+	 * need more. The dpaa gate (same predicate as the ingress
+	 * enumerator) keeps a non-FMan member from winning the hash and
+	 * fail-closing the whole flow (-ENODEV at fqid resolve) although
+	 * another slave could carry it, and keeps the cap counting only
+	 * ports that can actually own a TX FQ.
 	 */
 	if (!netif_is_bond_slave(lower) || !netif_running(lower) ||
 	    !netif_carrier_ok(lower))
+		return 0;
+
+	if (ask_hw_dev_port(lower, &pid))
 		return 0;
 
 	if (s->n == ASK_BOND_MAX_SLAVES) {
