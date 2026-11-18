@@ -102,7 +102,12 @@ Run (sandbox, 2026-11-18, this tree):
   guaranteed false FAIL — P4 captures members with `inbound`), and the kernel
   taps BEFORE the ingress qdisc runs (so a tc filter drop is invisible to
   tcpdump — P6 self-validates on the qdisc's own `dropped N` counter, not on
-  tcpdump; round 8).
+  tcpdump; round 8);
+- round 10: `interfaces_bonding.verify()` executes in the chain gate — the
+  ASK2 offload commit guards (mode 802.3ad, MTU [1280,9000], FMan members)
+  are host-proven to raise on the bad configs and pass the good one; the
+  kunit harness builds AND LINKS locally with `90-kunit.config` merged
+  (`ask_kunit.ko` produced — RUN still board/CI only).
 
 Pending (board gate — hardware expected week of 2026-11-23):
 
