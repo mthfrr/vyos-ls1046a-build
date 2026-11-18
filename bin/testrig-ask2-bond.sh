@@ -72,9 +72,12 @@ flows(){ d "sudo /usr/local/bin/ynl --family ask --dump dump-flows --output-json
          python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo ERR; }
 cpu(){ d "grep '^cpu ' /proc/stat"; }
 busy(){ printf '%s\n%s\n' "$1" "$2" | awk '{for(i=2;i<=11;i++)a[NR,i]=$i} END{for(i=2;i<=11;i++){x=a[2,i]-a[1,i];T+=x;if(i==5||i==6)id+=x}; printf "%.1f",100*(T-id)/T}'; }
-max_gap(){ python3 - "$1" <<'PY'
+max_gap(){ python3 - "$1" "$2" <<'PY'
 import re, sys
-txt = open(sys.argv[1]).read() if open(sys.argv[1]).read() else ''
+try:
+    txt = open(sys.argv[1]).read()
+except OSError:
+    txt = ''
 seqs = [int(m) for m in re.findall(r'icmp_seq=(\d+)', txt)]
 g = max((b - a for a, b in zip(seqs, seqs[1:]) if b - a > 1), default=0)
 print('%.1f' % (g / float(sys.argv[2])))
