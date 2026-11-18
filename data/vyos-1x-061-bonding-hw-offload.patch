@@ -11,7 +11,12 @@ offload leaf / member-set changes via the configd dependency machinery;
 extends the patch 058 auto hardware flowtable to offloaded bonds (device =
 bond master; ask.ko spreads ingress records across members itself) and
 resolves flowtable devices to member ports for `ethtool -K
-hw-tc-offload on` since the bond master owns no NETIF_F_HW_TC.
+hw-tc-offload on` since the bond master owns no NETIF_F_HW_TC. Also fixes
+interfaces_ethernet.py's bond-option inheritance copy to use
+dict_set_nested(): dict_set() does not create intermediate keys, so
+inheriting the multi-segment offload.ipv4/ipv6 leaves into a member without
+an own "offload" node raised KeyError and failed the commit (upstream only
+ever inherited the single-segment "mtu", which cannot trigger it).
 
 Pairs with kernel Increments 1+2 (see doc/CHANGES-LACP.md upstream notes).
 
@@ -316,3 +321,31 @@ index a639013c3..f809382f6 100644
  
      # WireGuard data packets are encrypted and never offloaded, so tracking
      # the outer UDP flow only costs cycles (conntrack, helper and firewall
+diff --git a/src/conf_mode/interfaces_ethernet.py b/src/conf_mode/interfaces_ethernet.py
+index 2896f12..6bb8fad 100644
+--- a/src/conf_mode/interfaces_ethernet.py
++++ b/src/conf_mode/interfaces_ethernet.py
+@@ -46,6 +46,7 @@
+ from vyos.utils.dict import dict_search
+ from vyos.utils.dict import dict_to_paths_values
+ from vyos.utils.dict import dict_set
++from vyos.utils.dict import dict_set_nested
+ from vyos.utils.dict import dict_delete
+ from vyos.utils.network import get_vrf_tableid
+ from vyos.utils.process import is_systemd_service_running
+@@ -151,7 +152,14 @@ def update_bond_options(conf: Config, eth_conf: dict) -> list:
+                         f'Cannot apply "{cli_path(option_path)}" to "{dict_search(option_path, config_with_defaults)}".' \
+                         f' Interface "{eth_conf["ifname"]}" is a bond member. ' \
+                         f'Option is inherited from bond "{bond_name}"')
+-                dict_set(option_path, bond_option_value, eth_conf)
++                # LS1046A ASK2 (Inc 4 fix): dict_set() does not create missing
++                # intermediate keys, so inheriting a multi-segment option
++                # (bond "offload ipv4|ipv6" copied into members that carry no
++                # "offload" node of their own) KeyError-crashed here --
++                # upstream never hit it because its only inherited option,
++                # "mtu", is single-segment. dict_set_nested() is equivalent
++                # for single-segment paths and creates the parent otherwise.
++                dict_set_nested(option_path, bond_option_value, eth_conf)
+     eth_conf['bond_blocked_changes'] = blocked_list
+     return None
+ 

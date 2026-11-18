@@ -124,10 +124,19 @@ e2 "which iperf3" >/dev/null || abort preflight 'iperf3 missing on GEN2'
 for i in $DUT_PORTS; do d "sudo ip addr flush dev $i; sudo ip link set $i nomaster 2>/dev/null; true"; done
 
 ##### P1 — bond bring-up (DUT side) + forced-transit routing on the generators
-vy_d "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 lacp-rate fast" \
+# Loud failure here matters: an ISO built before the review-r9 fix of patch
+# 061 (bond-option inheritance KeyError in interfaces_ethernet) fails THIS
+# commit for any member-carrying offloaded bond - P0 (member-less bond9)
+# cannot see it. Abort with the session output instead of letting the
+# LACP check below misreport it as a wiring problem.
+p1out=$(vy_d "set interfaces bonding bond0 mode 802.3ad" "set interfaces bonding bond0 lacp-rate fast" \
      "set interfaces bonding bond0 offload ipv4" "set interfaces bonding bond0 offload ipv6" \
      $(for i in $DUT_PORTS; do echo "set interfaces bonding bond0 member interface $i"; done) \
-     "set interfaces bonding bond0 address $D4/24" "set interfaces bonding bond0 address $D6/64"
+     "set interfaces bonding bond0 address $D4/24" "set interfaces bonding bond0 address $D6/64")
+if echo "$p1out" | grep -qi 'Error:'; then
+  printf '%s\n' "$p1out" > "$RUN/bond-p1-bringup.txt"
+  abort P1 "bond bring-up commit failed (ISO older than the r9 patch-061 inheritance fix? see bond-p1-bringup.txt)"
+fi
 e1 "sudo ip addr replace $E14/24 dev $BOND_EP1_IF; sudo ip -6 addr replace $E16/64 dev $BOND_EP1_IF nodad
     sudo ip route replace $E24/32 via $D4 dev $BOND_EP1_IF; sudo ip -6 route replace $E26/128 via $D6 dev $BOND_EP1_IF"
 e2 "sudo ip addr replace $E24/24 dev $BOND_EP2_IF; sudo ip -6 addr replace $E26/64 dev $BOND_EP2_IF nodad
