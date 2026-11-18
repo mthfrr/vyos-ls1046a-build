@@ -567,7 +567,8 @@ if (ingress_ports[0]) {
 		u32 id = 0;
 		int arc;
 
-		kc.port_id = ingress_ports[i];	/* FE ehash key byte 0 */
+		/* selects the per-port ehash table (F-220), not a key byte */
+		kc.port_id = ingress_ports[i];
 		arc = ask_hw_flow_preflight_port(&kc, oif, action_flags,
 						 dir, ingress_ports[i]);
 		if (!arc)

@@ -464,7 +464,10 @@ int  ask_hw_flow_preflight(const struct ask_flow_key *key,
  * from key->iif — needed for bond ingress, where key->iif names the
  * bond (no FMan port) and each record copy is steered to one member
  * port's ehash table. key->port_id MUST be set to @port_id by the
- * caller (it is FE ehash key byte 0, F-163).
+ * caller: it selects the per-port ehash TABLE (F-220) and the F-195
+ * own-port miss FQID — it is NOT part of the key bytes (the silicon
+ * PORT_ID extraction reads the zeroed scheme default, so k[0] is a
+ * constant 0x00/v4-0/v6-1 family lane; see F-188 in ask_fe_build_key).
  */
 int  ask_hw_flow_preflight_port(const struct ask_flow_key *key,
 				u32 oif, u32 action_flags,
