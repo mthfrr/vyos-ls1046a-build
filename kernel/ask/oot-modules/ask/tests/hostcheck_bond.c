@@ -44,9 +44,11 @@ static uint32_t bond_hash_index(const struct key *k, unsigned int n)
 		hash ^= sip ^ dip;
 	}
 	hash ^= ((uint32_t)k->sport << 16) | (uint32_t)k->dport;
-	hash *= GOLDEN_RATIO_32;	/* xor-folds cluster; spread needs mix */
 
-	return hash % n;
+	/* high word of the 64-bit golden-ratio product -- see ask_bond.c:
+	 * mod n must read MIXED bits, not the raw low bits of the fold
+	 * (sport lives in bits 16..31 and would never reach a mod 2/4 pick). */
+	return (uint32_t)(((uint64_t)hash * GOLDEN_RATIO_32) >> 32) % n;
 }
 
 /* Verbatim mirror of the withdraw worst-rc fold (n_copies > 0 arm). */
@@ -71,11 +73,8 @@ static int withdraw_fold(const int *rrc, unsigned int n)
 static void fill_seq(struct key *k, unsigned int i)
 {
 	/* Same memory image as the kunit key builders: addresses and ports
-	 * stored in network order (htonl/htons on the host). This matters:
-	 * % 2^m of a GOLDEN_RATIO multiply reads only the low bits of the
-	 * xor-fold, so native-order synthetic keys are a degenerate family
-	 * (they all collide mod 4) -- the wire-order image is what the
-	 * kernel hashes. */
+	 * stored in network order (htonl/htons on the host) -- the kernel
+	 * only ever hashes wire-order keys. */
 	uint32_t sip = __builtin_bswap32(0x0a000000u + i);
 	uint32_t dip = __builtin_bswap32(0xc0a80000u + (i << 8));
 
@@ -121,6 +120,26 @@ int main(void)
 			seen |= 1UL << bond_hash_index(&k, buckets);
 		}
 		assert(seen == (1UL << buckets) - 1);
+	}
+
+	/* sport-only spread (kunit: hash_spread_sport): ONE host pair, fixed
+	 * dport, 512 distinct sports must reach both members of a 2-slave
+	 * bond. Regression guard for the pre-r5 hash, whose mod 2^m read
+	 * only low fold bits and could never see sport at all. */
+	{
+		unsigned long seen = 0;
+		uint32_t sip = __builtin_bswap32(0x0a000064u);
+		uint32_t dip = __builtin_bswap32(0xc0a80001u);
+
+		for (i = 1024; i < 1536; i++) {
+			memset(&k, 0, sizeof(k));
+			memcpy(k.src_ip, &sip, 4);
+			memcpy(k.dst_ip, &dip, 4);
+			k.sport = (uint16_t)__builtin_bswap16((uint16_t)i);
+			k.dport = (uint16_t)__builtin_bswap16(5201);
+			seen |= 1UL << bond_hash_index(&k, 2);
+		}
+		assert(seen == 0x3);
 	}
 
 	/* withdraw fold precedence: EAGAIN > hard > ESTALE > 0 */

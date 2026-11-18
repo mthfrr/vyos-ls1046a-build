@@ -131,12 +131,35 @@ static void ask_bond_test_hash_spread_v6(struct kunit *test)
 	expect_spread(test, 4, true);
 }
 
+/*
+ * Sport-only spread (review r5): ONE host pair, fixed dport, 512 distinct
+ * sports must reach both members of a 2-slave bond. Regression guard for
+ * the pre-r5 hash: (h*odd) % 2^m reads only h's low bits, and sport folds
+ * into bits 16..31, so every flow between one host pair pinned to one
+ * member -- precisely the server-traffic pattern offload exists for.
+ */
+static void ask_bond_test_hash_spread_sport(struct kunit *test)
+{
+	unsigned long seen = 0;
+	unsigned int i;
+
+	for (i = 0; i < 512; i++) {
+		struct ask_flow_key k;
+
+		make_key_v4(&k, htonl(0x0a000064), htonl(0xc0a80001),
+			    htons((u16)(1024 + i)), htons(5201));
+		__set_bit(ask_bond_hash_index(&k, 2), &seen);
+	}
+	KUNIT_EXPECT_EQ(test, seen, 0x3UL);
+}
+
 static struct kunit_case ask_bond_test_cases[] = {
 	KUNIT_CASE(ask_bond_test_hash_deterministic),
 	KUNIT_CASE(ask_bond_test_hash_bounds),
 	KUNIT_CASE(ask_bond_test_hash_spread_4),
 	KUNIT_CASE(ask_bond_test_hash_spread_2),
 	KUNIT_CASE(ask_bond_test_hash_spread_v6),
+	KUNIT_CASE(ask_bond_test_hash_spread_sport),
 	{}
 };
 

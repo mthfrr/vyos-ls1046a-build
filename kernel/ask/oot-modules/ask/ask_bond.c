@@ -37,9 +37,9 @@
  * Pure hash: mirrors the *intent* of bonding's layer3+4 xmit policy
  * (bitwise parity with bond_xmit_hash() is NOT required; determinism and
  * spread are -- PLAN D2). XOR-fold the address words and the port pair,
- * avalanche with the golden-ratio multiply, mod the eligible-slave count.
- * IPv4 keys keep zero in src_ip/dst_ip[4..15], so the 4-word fold needs
- * no family branch (IPv6 folds all 16 bytes across the same four words).
+ * then index the eligible-slave set. IPv4 keys keep zero in
+ * src_ip/dst_ip[4..15], so the 4-word fold needs no family branch (IPv6
+ * folds all 16 bytes across the same four words).
  */
 u32 ask_bond_hash_index(const struct ask_flow_key *key, unsigned int n)
 {
@@ -57,9 +57,17 @@ u32 ask_bond_hash_index(const struct ask_flow_key *key, unsigned int n)
 		hash ^= (__force u32)sip ^ (__force u32)dip;
 	}
 	hash ^= ((u32)key->sport << 16) | (u32)key->dport;
-	hash *= GOLDEN_RATIO_32;	/* xor-folds cluster; spread needs mix */
 
-	return hash % n;
+	/*
+	 * Extract from the HIGH word of the 64-bit golden-ratio multiply
+	 * (murmur3-finalizer style), then mod n. A 32-bit multiply followed
+	 * by %n would read only the LOW bits -- and (h*odd) mod 2^k depends
+	 * only on h mod 2^k -- so for a power-of-2 slave count (2 or 4: the
+	 * realistic bonds) sport, which folds into the high 16 bits, could
+	 * never influence the pick: every flow between one host pair would
+	 * pin to one member. The high word mixes every input bit.
+	 */
+	return (u32)(((u64)hash * GOLDEN_RATIO_32) >> 32) % n;
 }
 #ifdef ASK_KUNIT_EXPORTS
 EXPORT_SYMBOL_GPL(ask_bond_hash_index);
