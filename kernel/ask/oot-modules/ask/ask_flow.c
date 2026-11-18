@@ -429,6 +429,12 @@ return -EINVAL;
  * so ask_max_flows bounds FE records, not just table entries. For every
  * other ingress need == 1 and n_hw == 1, making gate and accounting
  * numerically identical to the legacy `>= ask_max_flows`.
+ * Ponytail ceiling (pre-existing shape, widened x n_hw by the fan-out):
+ * the gate read and the post-publish charge are not atomic, so
+ * concurrent inserts can transiently overshoot ask_max_flows by the
+ * number of racing replacers. Upgrade path if it ever matters: reserve
+ * at gate time (atomic_add(need) before insert, unwind on every failure
+ * arm) instead of charging after publish.
  */
 need = ask_bond_ingress_copies(key, ingress_ports,
 			       ASK_FLOW_MAX_INGRESS_COPIES);
@@ -545,7 +551,12 @@ u64_stats_init(&f->stats.syncp);
  * single path. A copy that fails admits only itself to software (D5);
  * if ALL fail, the first copy's rc drives the legacy dispatch
  * below so the caller contract (-ENODEV/-EOPNOTSUPP SW-mirror,
- * -EAGAIN pending, hard errors propagate) is unchanged.
+ * -EAGAIN pending, hard errors propagate) is unchanged. Ceiling
+ * (same posture as the F4 residual in doc/CHANGES-LACP.md): if copy
+ * 0 returns -EAGAIN but a later copy inserts, the entry publishes
+ * without the parked copy -- that member stays SW-forwarded until
+ * the record retires; no pending replay re-adds copies to a live
+ * entry.
  */
 if (ingress_ports[0]) {
 	unsigned int i;
