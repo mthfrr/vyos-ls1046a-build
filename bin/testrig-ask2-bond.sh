@@ -182,9 +182,20 @@ for rep in $(seq 1 "$REPS"); do for fam in 4 6; do
 done; done
 
 ##### P4 — LACPDU punt under engaged offload (timeout covers the switch's 30 s slow rate)
-d "sudo timeout 40 tcpdump -qi bond0 -c1 'ether proto 0x8809' -nn" > "$RUN/bond-lacpdu.txt" 2>&1 \
-  && res PASS P4 'LACPDUs visible on bond0 while offload engaged' \
-  || res FAIL P4 'no LACPDUs on bond0 - punt regression (bond-lacpdu.txt)'
+# The capture point must be the MEMBER, not bond0: 802.3ad bonding CONSUMES
+# LACPDUs in its rx_handler (bond_3ad_rx_indication returns RX_HANDLER_CONSUMED),
+# so they never surface on the bond master's tap even on a perfect system - a
+# bond0 capture would be a guaranteed false FAIL. The member tap sees ingress
+# before rx_handler runs (same tap P6 self-validates on). 'inbound' matters:
+# the DUT itself TXes LACPDUs at the partner rate (lacp-rate fast -> 1/s), and
+# those match 0x8809 unconditionally -> without the qualifier this is a
+# guaranteed true-positive on ANY state of the punt path.
+p4_ok=1
+for i in $DUT_PORTS; do
+  d "sudo timeout 40 tcpdump -qi $i -c1 -nn 'inbound and ether proto 0x8809'" > "$RUN/bond-lacpdu-$i.txt" 2>&1 \
+    || { p4_ok=0; res FAIL P4 "no inbound LACPDUs on $i - punt regression (bond-lacpdu-$i.txt)"; }
+done
+[ $p4_ok = 1 ] && res PASS P4 'LACPDUs punted to host on every member while offload engaged'
 
 ##### P5 — failover under load: pull one member, measure the transit gap (Inc 3 input)
 e1 "ping -i 0.1 -c $((10 * (2 * FAILSECS))) $E24 > /tmp/bond-fail-ping.txt 2>&1 &
@@ -242,8 +253,11 @@ d "sudo tc qdisc add dev $MEM1 ingress 2>/dev/null
    sudo tc filter add dev $MEM1 parent ffff: protocol all prio 1 u32 match u16 0x8809 0xffff at -2 action drop" >/dev/null 2>&1
 sleep 3
 # self-validation: tcpdump on the member (its tap sees ingress before the qdisc
-# verdict) - if PDUs still arrive, the filter is broken; SKIP honestly
-if d "sudo timeout 5 tcpdump -qi $MEM1 -c1 'ether proto 0x8809'" >/dev/null 2>&1; then
+# verdict) - if PDUs still arrive, the filter is broken; SKIP honestly. 'inbound'
+# is REQUIRED: the DUT keeps TXing its own LACPDUs every second (lacp-rate fast)
+# and outbound copies would match the bare filter, turning every real run into a
+# false SKIP.
+if d "sudo timeout 5 tcpdump -qi $MEM1 -c1 'inbound and ether proto 0x8809'" >/dev/null 2>&1; then
   res SKIP P6 'tc filter did not stop LACPDUs (syntax varies by iproute2) - repeat the drop your way, then measure'
 else
   sleep 30

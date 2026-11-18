@@ -13,7 +13,7 @@ It owns only the glue that neither spec owns.
 
 - **One image, three runtime states, no build-time dataplane choice.** Every ISO ships `ask.ko` and VPP, and the dataplane is selected by configuration.
 - **S1 classification is the FE-VM enhanced external hash** (ehash), dispatched directly by RCCB to the per-port hash table. A HIT executes the inline opcodes in the record and enqueues to a per-egress no-confirm TX FQ. The CC-tree "top-N plus software tail" model is retired.
-- **In hardware today:** routed IPv4/IPv6, NAT44/NAT66, single-tag VLAN pop/push/translate, PPPoE encap/decap, and bridge learned-MAC/B7a. Everything else is a kernel software fallback; the current list is in master §1.2.
+- **In hardware today:** routed IPv4/IPv6, NAT44/NAT66, single-tag VLAN pop/push/translate, PPPoE encap/decap, and bridge learned-MAC/B7a. Everything else is a kernel software fallback; the current list is in master §1.2. Offload over an 802.3ad bond (per-member ingress records, deterministic egress pick) is implemented on `feat/lacp` and pending board acceptance — no new silicon mode, see `plans/ASK2-BOND-OFFLOAD-PLAN.md`.
 - **Port init:** every RX port boots with a 96 B internal margin and parse-start offset (`FMBM_RIM 0x60000000`, `FMBM_RPSO 0x60`, patch 0217). This is static and identical in S0, S1 and S2, so it is not a mode-switch delta.
 
 ## 2. Silicon mode state machine
@@ -69,8 +69,21 @@ Each forward write lands with its inverse in the same patch, and the inverse is 
 set interfaces ethernet eth3 offload ipv4      # engage IPv4 ASK on eth3
 set interfaces ethernet eth3 offload ipv6      # engage IPv6 ASK on eth3
 delete interfaces ethernet eth3 offload ipv4   # that family back to S0
+set interfaces bonding bond0 offload ipv4      # engage every member port (802.3ad only, patch 061)
 set vpp settings interface eth4                # VPP on another port
 ```
+
+- **Bond engagement (feat/lacp, pending board acceptance).** `offload ipv4|ipv6` on a
+  bonding interface arms the member ports' family masks through bond option
+  inheritance — the bond owns the mask; a member re-commit can never silently
+  disengage it. No new silicon state: the bond is purely a flow-level construct
+  in `ask.ko` (one FE ingress record per member, per-flow egress slave pick,
+  conservative flush on any member/bond event). Engagement remains per physical
+  port; the bond CLI is sugar over the members' S0→S1 transitions, and deleting
+  the leaves returns every member to S0 by the same verified path. The
+  validator keeps the existing VPP mutex (a bond member in `vpp settings` is
+  already rejected) and adds: mode 802.3ad, MTU 1280..9000, members ⊂ eth0-eth4.
+  Contract and ceilings: `plans/ASK2-BOND-OFFLOAD-PLAN.md`.
 
 - **Granularity is per port and per IP family only** (`vyos-1x-031`, migration `039`). VLAN, NAT, PPPoE (on the PPPoE source-interface port) and bridge are automatic parts of an engaged port. There are no per-capability leaves (`054` removed them). The `ask.*` module parameters `vlan_offload`, `pppoe_offload`, `nat44_offload`, `nat66_offload`, `ipv6_hw_frag` and `bridge_offload` are global kill switches, not operator CLI.
 - There is no global ASK knob. `set system offload classify` (`vyos-1x-026`) is deprecated: the mechanism stays and RSS plus the parser are silent defaults.
