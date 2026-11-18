@@ -110,7 +110,7 @@ vy_d_ok "set interfaces bonding bond9 mode round-robin" \
 vy_d_ok "set interfaces bonding bond9 mtu 9500" \
   && res FAIL P0 'MTU 9500 + offload committed (guard missing)' \
   || res PASS P0 'MTU outside [1280,9000] + offload rejected'
-d "vbash -c 'configure; delete interfaces bonding bond9; commit; exit discard'" >/dev/null 2>&1
+vy_d "delete interfaces bonding bond9" >/dev/null
 
 ##### preflight — generator basics, then free the DUT members
 e1 "which iperf3" >/dev/null || abort preflight 'iperf3 missing on GEN1'
