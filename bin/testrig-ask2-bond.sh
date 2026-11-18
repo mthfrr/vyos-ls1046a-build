@@ -70,6 +70,12 @@ res(){ local r=$1 ph=$2; shift 2
 abort(){ res ABORT "$1" "$2"; exit 1; }
 flows(){ d "sudo /usr/local/bin/ynl --family ask --dump dump-flows --output-json" 2>/dev/null |
          python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo ERR; }
+# Q1 accounting: get-info num-flows counts CHARGED FE copies (bond flows carry
+# one per member); the table dump above counts entries and cannot see an
+# orphaned FE record - a persistent charged-vs-entry drift is the record-leak
+# signal (CHANGES-LACP.md review round 4 F-R4-1).
+charged(){ d "sudo /usr/local/bin/ynl --family ask --do get-info --output-json" 2>/dev/null |
+           python3 -c 'import json,sys;print(json.load(sys.stdin)["info"]["num-flows"])' 2>/dev/null || echo ERR; }
 cpu(){ d "grep '^cpu ' /proc/stat"; }
 busy(){ printf '%s\n%s\n' "$1" "$2" | awk '{for(i=2;i<=11;i++)a[NR,i]=$i} END{for(i=2;i<=11;i++){x=a[2,i]-a[1,i];T+=x;if(i==5||i==6)id+=x}; printf "%.1f",100*(T-id)/T}'; }
 max_gap(){ python3 - "$1" "$2" <<'PY'
@@ -256,15 +262,15 @@ sleep 30
 ##### P7 — member re-add cycles under churn, record-leak watch
 e1 "iperf3 -c $E24 -B $E14 -p 5281 -t $((8 * LEAK_REPS)) -P 4 --bidir -i 5 > /dev/null 2>&1 &"
 sleep 3
-base=$(flows)
+base=$(flows); base_c=$(charged)
 for i in $(seq 1 "$LEAK_REPS"); do
   vy_d "delete interfaces bonding bond0 member interface $MEM2" >/dev/null; sleep 2
   vy_d "set interfaces bonding bond0 member interface $MEM2"   >/dev/null; sleep 2
 done
-sleep 15; after=$(flows)
+sleep 15; after=$(flows); after_c=$(charged)
 e1 "pkill -f 'iperf3 -c' 2>/dev/null" 2>/dev/null
 d "sudo /usr/local/bin/ynl --family ask --dump dump-flows --output-json" > "$RUN/bond-flows-after-churn.json" 2>/dev/null
-res MEASURE P7 "flow table: baseline=$base after $LEAK_REPS member cycles=$after (compare again after settle; persistent growth = record leak)"
+res MEASURE P7 "flow table: baseline=$base/$base_c after $LEAK_REPS member cycles=$after/$after_c entries/charged (compare again after settle; persistent growth - esp. of charged - = record leak; orphans are invisible to entries)"
 
 ##### P8 — budget clamp (D5: overflow must stay in software, never wedge)
 before=$(d "cat /sys/module/ask/parameters/max_flows")
@@ -272,11 +278,17 @@ d "sudo sh -c 'echo 4 > /sys/module/ask/parameters/max_flows'"
 e1 "for n in 1 2 3 4 5 6 7 8; do (iperf3 -c $E24 -B $E14 -p 5281 -t 6 -P 1 -w 256k >/dev/null 2>&1 &); sleep 1; done"
 sleep 8
 n_clamped=$(flows)
+# The budget bounds CHARGED FE copies, not table entries: gate on num-flows
+# (a 2-member bond doubles copies per entry - the sharpest available check
+# that Q1 accounting holds under pressure). Margin 2x covers the documented
+# transient gate overshoot (ask_flow.c insert-core budget comment).
+c_clamped=$(charged)
 d "sudo sh -c 'echo $before > /sys/module/ask/parameters/max_flows'"
 ping_ok=$(e1 "ping -c2 -W2 $E24 >/dev/null" && echo yes || echo no)
-[ "$n_clamped" != ERR ] && [ "$n_clamped" -le 12 ] && [ "$ping_ok" = yes ] \
-  && res PASS P8 "budget clamp held (dumped=$n_clamped vs cap 4, ping fine) - no wedge" \
-  || res FAIL P8 "budget clamp anomaly (dumped=$n_clamped ping=$ping_ok)"
+[ "$n_clamped" != ERR ] && [ "$c_clamped" != ERR ] && [ "$c_clamped" -le 8 ] \
+  && [ "$n_clamped" -le 12 ] && [ "$ping_ok" = yes ] \
+  && res PASS P8 "budget clamp held (charged=$c_clamped vs cap 4, dumped=$n_clamped, ping fine) - no wedge" \
+  || res FAIL P8 "budget clamp anomaly (charged=$c_clamped dumped=$n_clamped ping=$ping_ok)"
 
 ##### summary
 res INFO ALL "PASS=$PASS FAIL=$FAIL - artefacts in $RUN; paste back bond-results.txt at minimum"
