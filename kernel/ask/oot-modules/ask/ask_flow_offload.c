@@ -1064,8 +1064,6 @@ struct ask_neigh_mac_fixup {
 	u32                 action_flags;
 	u8                  dir;
 	u64                 generation; /* A3: owner stamp snapshotted at collect */
-	struct ask_hw_copy  copies[ASK_FLOW_MAX_INGRESS_COPIES]; /* Inc 2 */
-	unsigned int        n_copies;
 };
 
 /*
@@ -1114,9 +1112,6 @@ static int ask_neigh_mac_collect(struct ask_flow *f, void *arg)
 	fx->action_flags = f->action_flags;
 	fx->dir          = f->dir;
 	fx->generation   = f->generation;
-	fx->n_copies     = min_t(unsigned int, f->n_hw,
-				 ASK_FLOW_MAX_INGRESS_COPIES);
-	memcpy(fx->copies, f->hw, fx->n_copies * sizeof(fx->copies[0]));
 	list_add_tail(&fx->node, &ctx->fixups);
 	ctx->matched++;
 	return 0;
