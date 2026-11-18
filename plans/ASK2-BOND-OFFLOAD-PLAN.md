@@ -98,9 +98,11 @@ Run (sandbox, 2026-11-18, this tree):
   every patched `.py` compiles; the offload XML node renders in the correct
   tree position;
 - `bash -n` on the rig battery; P4/P6 capture points corrected in review
-  round 7 (bonding CONSUMES LACPDUs in its rx_handler — a bond0 tap is a
-  guaranteed false FAIL; the member tap plus the `inbound` qualifier is the
-  only correct punt probe).
+  rounds 7–8: bonding CONSUMES LACPDUs in its rx_handler (a bond0 tap is a
+  guaranteed false FAIL — P4 captures members with `inbound`), and the kernel
+  taps BEFORE the ingress qdisc runs (so a tc filter drop is invisible to
+  tcpdump — P6 self-validates on the qdisc's own `dropped N` counter, not on
+  tcpdump; round 8).
 
 Pending (board gate — hardware expected week of 2026-11-23):
 

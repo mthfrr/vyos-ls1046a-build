@@ -186,7 +186,9 @@ done; done
 # LACPDUs in its rx_handler (bond_3ad_rx_indication returns RX_HANDLER_CONSUMED),
 # so they never surface on the bond master's tap even on a perfect system - a
 # bond0 capture would be a guaranteed false FAIL. The member tap sees ingress
-# before rx_handler runs (same tap P6 self-validates on). 'inbound' matters:
+# before rx_handler consumes it (__netif_receive_skb_core taps, then rx_handler;
+# no ingress filter is involved in P4, so the tap IS the right probe here).
+# 'inbound' matters:
 # the DUT itself TXes LACPDUs at the partner rate (lacp-rate fast -> 1/s), and
 # those match 0x8809 unconditionally -> without the qualifier this is a
 # guaranteed true-positive on ANY state of the punt path.
@@ -252,13 +254,16 @@ sleep 12   # let the iperf flows age past the offload delay so they ARE on silic
 d "sudo tc qdisc add dev $MEM1 ingress 2>/dev/null
    sudo tc filter add dev $MEM1 parent ffff: protocol all prio 1 u32 match u16 0x8809 0xffff at -2 action drop" >/dev/null 2>&1
 sleep 3
-# self-validation: tcpdump on the member (its tap sees ingress before the qdisc
-# verdict) - if PDUs still arrive, the filter is broken; SKIP honestly. 'inbound'
-# is REQUIRED: the DUT keeps TXing its own LACPDUs every second (lacp-rate fast)
-# and outbound copies would match the bare filter, turning every real run into a
-# false SKIP.
-if d "sudo timeout 5 tcpdump -qi $MEM1 -c1 'inbound and ether proto 0x8809'" >/dev/null 2>&1; then
-  res SKIP P6 'tc filter did not stop LACPDUs (syntax varies by iproute2) - repeat the drop your way, then measure'
+# self-validation: the qdisc's own drop counter. tcpdump CANNOT self-validate
+# here: __netif_receive_skb_core delivers to the ptype_all taps BEFORE
+# sch_handle_ingress runs the filter, so even a perfectly working ingress drop
+# still shows every PDU to tcpdump (that is why the filter-less P4 capture on
+# the member works, and why a tcpdump gate here was a guaranteed false SKIP -
+# review r8, superseding r7's 'inbound' fix which reasoned from the rx_handler
+# order that does not matter for this). The filter's "dropped N" counter is the
+# only evidence upstream of the qdisc verdict.
+if ! d "sudo tc -s -n filter show dev $MEM1 ingress" 2>/dev/null | grep -qE 'dropped [1-9]'; then
+  res SKIP P6 'tc filter dropped 0 packets (add failed or syntax varies by iproute2) - repeat the drop your way, then measure'
 else
   sleep 30
   d "cat /proc/net/bonding/bond0" > "$RUN/bond-dut-quiet.txt"
