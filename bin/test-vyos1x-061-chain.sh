@@ -12,6 +12,9 @@
 #    (mode 802.3ad, MTU [1280,9000], members ⊂ eth0-eth4) really raise on the
 #    bad configs and stay silent on the good one (Inc 4 guards had no
 #    host-side execution coverage before; only the rig P0 covered them).
+# 5) firewall.py's auto-flowtable generator executes: the offloaded bond
+#    joins VYOS_FLOWTABLE_ASK_AUTO per family; disabled/leaf-less/user-covered
+#    bonds do not (review round 11).
 #
 # Needs the local vyos-1x dev clone (no network). Run: bin/test-vyos1x-061-chain.sh
 set -eu
@@ -122,3 +125,47 @@ ib.verify(bond(mode='round-robin', **mem(['eth9'])))
 print('OK: guards stay silent without the offload leaves')
 PY
 echo "OK: interfaces_bonding offload guards execute clean"
+
+# 5) execute firewall.py's auto-flowtable generator from the PATCHED tree:
+#    an offloaded bond must join VYOS_FLOWTABLE_ASK_AUTO per family, while a
+#    disabled bond, a bond without the leaves, and a bond already covered by
+#    a user flowtable must NOT (Inc 4; r9 lesson — python that never runs is
+#    dead on arrival).
+cd "$SCRATCH" && python3 - <<'PY'
+import sys, types, importlib.util
+sys.path.insert(0, 'python'); sys.path.insert(0, 'src/conf_mode')
+def stub(name):
+    m = types.ModuleType(name)
+    m.__getattr__ = lambda k: (lambda *a, **kw: None)
+    sys.modules[name] = m
+for n in ('netifaces', 'systemd', 'systemd.journal', 'vpp_papi'):
+    stub(n)
+ni = sys.modules['netifaces']
+ni.AF_INET, ni.AF_INET6, ni.AF_LINK = 2, 10, 17
+stub('vyos.geoip')   # pulls paramiko/requests via vyos.remote; unused here
+sys.excepthook = sys.__excepthook__
+spec = importlib.util.spec_from_file_location(
+    'fw', 'src/conf_mode/firewall.py')
+fw = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fw)
+class Conf:
+    def __init__(self, eth, bond):
+        self.d = {('interfaces', 'ethernet'): eth,
+                  ('interfaces', 'bonding'): bond}
+    def get_config_dict(self, key, **kw):
+        return self.d[tuple(key)]
+conf = Conf({'eth1': {'offload': {'ipv4': {}}},
+             'eth2': {'offload': {'ipv4': {}, 'ipv6': {}}},
+             'eth5': {'disable': {}, 'offload': {'ipv4': {}}}},
+            {'bond0': {'offload': {'ipv4': {}, 'ipv6': {}}},
+             'bond1': {'disable': {}, 'offload': {'ipv4': {}}},
+             'bond2': {'mode': 'active-backup'},
+             'bond3': {'offload': {'ipv4': {}}}})
+auto = fw.get_ask_auto_flowtable(
+    conf, {'flowtable': {'FT': {'interface': ['bond3']}}})
+assert auto == {'ipv4': ['eth1', 'eth2', 'bond0'],
+                'ipv6': ['eth2', 'bond0']}, auto
+# a non-bond flowtable device must resolve to itself (no bonding/members)
+assert fw.get_hardware_offload_interfaces('eth1') == ['eth1']
+print('OK: firewall auto-flowtable bond loop + member resolution execute clean')
+PY
