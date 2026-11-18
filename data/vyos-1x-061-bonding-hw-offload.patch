@@ -109,8 +109,8 @@ index 08086e5d8..6b0f417cf 100644
 +    device `ifname` (LS1046A ASK2, Inc 4). A bond master owns no
 +    hw-tc-offload of its own - bonding keeps NETIF_F_HW_TC out of its
 +    feature set and rejects ethtool -K - so resolve to the current member
-+    ports the kernel reports. VLAN subinterfaces are resolved to their
-+    unique parent first by get_hardware_offload_interface()."""
++    ports the kernel reports (a member-less bond resolves to none). VLAN
++    subinterfaces are resolved to their unique parent first."""
      hardware_ifname = get_hardware_offload_interface(ifname)
 -    ethtool = Ethtool(hardware_ifname)
 -    enabled, fixed = ethtool.get_hw_tc_offload()
@@ -147,7 +147,7 @@ index 08086e5d8..6b0f417cf 100644
 +            members = f.read().split()
 +    except OSError:
 +        return [hardware_ifname]
-+    return members or [hardware_ifname]
++    return members
 +
 +
 +def verify_hardware_offload(ifname):
@@ -160,7 +160,7 @@ index 08086e5d8..6b0f417cf 100644
 +
 +        # LS1046A ASK2 (2026-08-21): a hardware flowtable engages FMan FE
 +        # forwarding, bounded to the order-0 RX buffer's conservative MTU range
-+        # (1280..3600). The DPAA1 RX pool is one contiguous 4 KiB order-0 page
++        # (1280..9000). The DPAA1 RX pool is one contiguous 4 KiB order-0 page
 +        # (F-222); frames above the ceiling overrun the one-buffer FMan RX contract
 +        # (cold-boot-only recovery), and below the floor is untested. Arming a
 +        # hardware flowtable on an interface whose MTU is outside this range can
